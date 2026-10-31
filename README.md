@@ -1,6 +1,6 @@
 # screen-guard
 
-**Version 1.0.0** - <https://github.com/toillover1337/lock-guard>
+**Version 1.1.0** - <https://github.com/toillover1337/lock-guard>
 
 Two small POSIX `sh` scripts that keep a desktop tidy around screen locking and monitor power
 cycling. Built on Xfce/X11 first, with parts for Wayland compositors and for other ways of
@@ -35,11 +35,12 @@ and window managers), then lists the **parts** of the program:
 | `wayland` | Wayland sessions: dimming through wl-gammarelay-rs or your own commands, your own input commands, `libinput` key listener |
 | `dbus` | noticing a lock over D-Bus (Xfce, GNOME, KDE and others announce it) |
 | `process` | noticing a lock by its locker program running (swaylock, gtklock, hyprlock, i3lock ...) |
+| `ddc` | lowering the monitors' real backlight over DDC/CI with `ddcutil` (works on X11 and Wayland) |
 
 The default keeps the parts for what is installed and removes the others from the installed copy
 (a machine where nothing can be detected keeps everything). Answer the prompt with a list
 (`x11,dbus`), `all`, or changes to the default (`+wayland`, `-process`); or give the answer up
-front: `./install.sh --variants x11,wayland,dbus,process`. At least one of x11/wayland and one of
+front: `./install.sh --variants x11,wayland,dbus,process,ddc`. At least one of x11/wayland and one of
 dbus/process must stay. A removed part is gone from that copy only; re-run the installer from the
 unpacked folder to add it back. `randr-fix` is installed only when `x11` is kept.
 
@@ -95,12 +96,13 @@ autostart entry does the right thing in each. `randr-fix` does nothing in a Wayl
 | lock noticed by | D-Bus (`dbus`) | locker process (`process`); `LOCK_DETECT="dbus process"` uses both |
 | input devices | `xinput`, chosen by `LOCK_DEVICE_PATTERN` | your own `INPUT_OFF_COMMAND` / `INPUT_ON_COMMAND` (there is no generic way) |
 | dimming | `xrandr --brightness` (+ keeper that re-dims) | wl-gammarelay-rs (needs `busctl`), or `DIM_COMMAND` / `UNDIM_COMMAND` |
+| real backlight | `ddc` part (`LOCK_BACKLIGHT`, ddcutil), the same on both | same |
 | early undim | raw key events from `xinput` | raw key events from `libinput debug-events` (needs the `input` group or root); or `lock-guard --undim` from a compositor keybind |
 | windows | saved on lock, restored by randr-fix | compositor keeps them |
 | monitor layout | `randr-fix` | compositor |
 
 What has and has not been tried: the X11 parts ran on one Xfce/Gentoo machine. The Wayland parts
-are tested against stand-ins for `busctl`, `libinput` and `pgrep` only; they have not run on a
+are tested against stand-ins for `busctl`, `libinput`, `pgrep` and `ddcutil` only; they have not run on a
 real compositor yet. Wayland compositors differ, so expect to set `LOCKER_PROCESSES`,
 `INPUT_OFF_COMMAND` and the dimming commands for yours. Wayland edge cases where `randr-fix`
 might be useful (outputs that come back at the wrong position after a power cycle) are not handled; a
@@ -108,7 +110,7 @@ port would use `wlr-randr` and would be added as another part.
 
 Tools used, by part: `awk` and `sed` always; `x11`: `xrandr` `xset` `xev` `xinput` `xprop` `wmctrl`
 (`xfdesktop` for icons, `xmodmap` for more key names in `UNDIM_KEY`, optional); `dbus`:
-`dbus-monitor`; `process`: `pgrep`; `wayland`: `busctl` + wl-gammarelay-rs for dimming, `libinput`
+`dbus-monitor`; `process`: `pgrep`; `ddc`: `ddcutil` (plus the `i2c-dev` kernel module and the `i2c` group); `wayland`: `busctl` + wl-gammarelay-rs for dimming, `libinput`
 for `UNDIM_KEY`. Tested with gawk, mawk and busybox awk. Debian/Ubuntu packages: `x11-apps x11-xserver-utils xinput wmctrl
 x11-utils dbus`; other distributions name them similarly. `stdbuf` (GNU coreutils) is used when present.
 
@@ -190,7 +192,7 @@ brightness. `DIM_OUTPUTS` limits it to named outputs (default: every connected o
 
 * It uses `xrandr --brightness`, which is software dimming: it scales what is drawn, and the
   monitor's backlight stays as it is, so a very dark room still sees a faint glow. For a real
-  backlight change use a hook with `ddcutil` instead (monitors differ in how well DDC/CI works).
+  backlight change see "Real backlight" below (`LOCK_BACKLIGHT`).
 * The brightness each output had is saved and put back exactly at unlock, when `lock-guard`
   stops or starts, and by `lock-guard --enable`. A saved value that is not plausible (some
   drivers report `0.0`) is restored as `1.0`, never as a black screen.
@@ -214,13 +216,50 @@ both `DIM_COMMAND` (gets the wanted level in `$LEVEL`) and `UNDIM_COMMAND` (must
 Nothing can read the brightness back from a compositor in general, so there is no keeper loop: if
 something else resets the brightness while locked, it stays reset.
 
+### Real backlight (optional, `ddc` part)
+
+```
+LOCK_BACKLIGHT=20
+```
+
+Gamma dimming (above) only scales what is drawn. This lowers each monitor's own backlight through
+DDC/CI, using `ddcutil`, in the same way on X11 and Wayland. The value is a percentage of the
+monitor's maximum, 1 to 100. It can be combined with `LOCK_BRIGHTNESS` or used on its own.
+
+Setting up (Gentoo names; elsewhere the packages are called `ddcutil`, and the module is `i2c-dev`):
+
+```
+sudo emerge --ask app-misc/ddcutil     # or your package manager
+sudo modprobe i2c-dev                   # and load it at boot
+sudo usermod -aG i2c YOURNAME           # then log in again
+ddcutil detect                          # your monitors should be listed
+ddcutil getvcp 10                       # "current value = 70, max value = 100"
+```
+
+* **Which monitors:** every monitor `ddcutil detect` lists (looked up once when `lock-guard`
+  starts), or only the I2C bus numbers in `BACKLIGHT_BUSES` (`I2C bus: /dev/i2c-11` is `11`).
+  `DDCUTIL_OPTIONS` adds options to every call, for example `--sleep-multiplier .5`.
+* **Saved and restored:** each monitor's value is written down before it is changed and put back at
+  unlock, at `--undim`, when `lock-guard` stops, and at start-up if a crash left a monitor dim.
+  A monitor that is asleep does not answer DDC, so the restore is retried for about 30 seconds.
+  A monitor that is already dimmer than the target is left alone.
+* **In the background:** each DDC call takes about a second, so they run in a worker that handles
+  dim and restore strictly in order; locking and unlocking are never delayed, and a quick lock
+  followed by an unlock still ends restored.
+* **Caveats:** support differs per monitor (some have DDC/CI switched off in their menu, some
+  ignore writes). Some monitors keep the value in memory that wears out, so this is meant for a
+  few changes a day. The backlight stays where it was set if the monitor loses power, so there is
+  no keeper loop like the gamma one. `UNDIM_KEY` and `lock-guard --undim` restore the backlight too.
+* `lock-guard --status` shows the current reading of each monitor (once the monitors are known)
+  and whether the backlight is lowered now.
+
 ### Early undim shortcut (optional)
 
 ```
 UNDIM_KEY=Ctrl+Shift+b
 ```
 
-Gives you a keyboard shortcut that restores the brightness while the screen is still locked, for
+Gives you a keyboard shortcut that restores the brightness (gamma and backlight) while the screen is still locked, for
 the moments you want the lock screen bright to see what you are doing. Everything else stays the
 same: dimmed at lock, restored at unlock. After the shortcut the screens stay bright until the
 next lock.
@@ -245,7 +284,7 @@ next lock.
   Nothing else is stored, logged or passed on, and the listener stops at unlock, when
   `lock-guard` stops, and by `--enable`. It is off unless you set `UNDIM_KEY`; pick a combination
   you never type in a password.
-* It starts only if `LOCK_BRIGHTNESS` is set and the screens really were dimmed.
+* It starts only if `LOCK_BRIGHTNESS` or `LOCK_BACKLIGHT` is set and the screens really were dimmed.
 * **Wayland:** the same setting works through `libinput debug-events --show-keycodes`, which needs
   read access to `/dev/input` (root, or membership of the `input` group); if it cannot read the
   keyboards the log says so (`the key listener ended by itself`). Numbers are still the X keycodes
@@ -309,12 +348,8 @@ Guix + mango, Gentoo with both).
 
 ## Known limits
 
-* Written and tested on one Xfce/Gentoo machine; the Wayland parts have only been run against
-  stand-ins (see "Environments"); the xfdesktop restart and `icons.screen0.yaml`
+* Written and tested on one Xfce/Gentoo machine; the Wayland parts and the real backlight have only
+  been run against stand-ins (see "Environments") and, for `ddcutil`, on two monitors; the xfdesktop restart and `icons.screen0.yaml`
   name follow that setup (other xfdesktop versions may name the file differently: set `ICON_FILE`).
 * Windows are restored by saved geometry only; windows that moved to another workspace or were
   closed are not tracked.
-
-## License
-
-GNU General Public License v3.0, see [LICENSE](LICENSE).

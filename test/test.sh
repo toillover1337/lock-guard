@@ -156,7 +156,7 @@ echo "shell under test: $SH"
 
 # ============================================================================ lock-guard
 fresh
-check "lock-guard --version" test "$(lg -V)" = "lock-guard 1.0.0"
+check "lock-guard --version" test "$(lg -V)" = "lock-guard $(cat "$ROOT/VERSION")"
 check "lock-guard --print-config has keys" sh -c "$SH $ROOT/lock-guard -p | grep -q '^SCREENSAVER_INTERFACES='"
 
 # default pattern: the user's real device list -> only the slave pointer (id 13), not XTEST / keyboards
@@ -758,7 +758,7 @@ done_with
 
 # ============================================================================ randr-fix
 fresh
-check "randr-fix --version" test "$(rf -V)" = "randr-fix 1.0.0"
+check "randr-fix --version" test "$(rf -V)" = "randr-fix $(cat "$ROOT/VERSION")"
 rf --detect > "$TMP/detected" 2>/dev/null
 check "detect: primary output" has "$TMP/detected" "^PRIMARY_OUTPUT=DisplayPort-0$"
 check "detect: primary rate" has "$TMP/detected" "^PRIMARY_RATE=144.00$"
@@ -942,7 +942,7 @@ if [ "$(id -u)" != 0 ] || command -v setpriv >/dev/null 2>&1; then
     XTOOLS="Xorg xrandr xset xinput xev xprop wmctrl dbus-monitor pgrep awk"
     mkscn debian "oxwm" "" "oxwm $XTOOLS"
     mkscn guix "" "mango" "mango busctl libinput pgrep awk"
-    mkscn gentoo "xfce" "mango" "xfce4-session mango $XTOOLS busctl libinput"
+    mkscn gentoo "xfce" "mango" "xfce4-session mango $XTOOLS busctl libinput ddcutil"
     mkscn blank "" "" "awk"
     chmod -R a+rX "$IH"; [ "$(id -u)" = 0 ] && chown -R 65534:65534 "$IH"
     # inst2 SCENARIO INIT [installer args...]  (fresh HOME each time is the caller's job)
@@ -974,9 +974,9 @@ if [ "$(id -u)" != 0 ] || command -v setpriv >/dev/null 2>&1; then
     check "detect guix: keeps wayland and process only" has "$IH/o" "Default parts to keep: wayland process$"
     inst2 gentoo openrc --list > "$IH/o" 2>&1
     check "detect gentoo: init" has "$IH/o" "init system : openrc"
-    check "detect gentoo: keeps everything" has "$IH/o" "Default parts to keep: x11 wayland dbus process$"
+    check "detect gentoo: keeps everything (ddcutil is installed there)" has "$IH/o" "Default parts to keep: x11 wayland dbus process ddc$"
     inst2 blank unknown --list > "$IH/o" 2>&1
-    check "detect: when nothing can be told every part is kept" has "$IH/o" "Default parts to keep: x11 wayland dbus process$"
+    check "detect: when nothing can be told every part is kept" has "$IH/o" "Default parts to keep: x11 wayland dbus process ddc$"
     check "detect: --list installs nothing" test ! -e "$IH/h/.local"
 
     # --- debian/oxwm: X11 only
@@ -988,6 +988,7 @@ if [ "$(id -u)" != 0 ] || command -v setpriv >/dev/null 2>&1; then
     check "x11 install: result lists what was kept" has "$IH/o" "kept   : x11, dbus"
     check "x11 install: result lists what was pruned" has "$IH/o" "pruned : wayland, process"
     check "x11 install: and why each one is not needed" has "$IH/o" "- wayland: Wayland sessions"
+    check "no ddcutil: the ddc part is pruned by default" sh -c "! grep -q '^#@@ begin ddc' $LGI"
     check "x11 install: valid shell" sh -c "$SH -n $LGI"
     check "x11 install: randr-fix installed" test -x "$IH/h/.local/bin/randr-fix"
     check "x11 install: sibling kept" has "$LGI" "^SIBLING=randr-fix$"
@@ -1009,6 +1010,12 @@ if [ "$(id -u)" != 0 ] || command -v setpriv >/dev/null 2>&1; then
     check "wayland install: shepherd users get the snippet" has "$IH/o" "shepherd-service"
     check "wayland install: wayland extras are checked" has "$IH/o" "libinput\|busctl\|Missing tools"
     check "wayland install: the config is written" test -s "$IH/h/.config/lock-guard/config"
+
+    # --- the ddc part can be asked for even where ddcutil is missing, and the installer says so
+    newhome
+    inst2 guix shepherd --yes --variants wayland,process,ddc --autostart none > "$IH/o" 2>&1
+    check "ddc: kept on request" sh -c "grep -q '^#@@ begin ddc' $LGI"
+    check "ddc: the missing ddcutil is reported" has "$IH/o" "Missing tools:.*ddcutil"
 
     # --- gentoo: both, nothing removed
     newhome
@@ -1042,14 +1049,14 @@ if [ "$(id -u)" != 0 ] || command -v setpriv >/dev/null 2>&1; then
     check "prompt: +name adds a part to the defaults" has "$LGI" "parts kept: x11 wayland dbus$"
     newhome
     printf -- '-process\n' | inst2 gentoo openrc --answers-from-stdin --autostart none > "$IH/o" 2>&1
-    check "prompt: -name removes one" has "$LGI" "parts kept: x11 wayland dbus$"
+    check "prompt: -name removes one" has "$LGI" "parts kept: x11 wayland dbus ddc$"
     newhome
     printf 'wayland,process\n' | inst2 debian systemd --answers-from-stdin --autostart none > "$IH/o" 2>&1
     check "prompt: a plain list replaces the defaults" has "$LGI" "parts kept: wayland process$"
     newhome
     printf 'nonsense\nall\n' | inst2 debian systemd --answers-from-stdin --autostart none > "$IH/o" 2>&1
     check "prompt: a bad answer asks again" has "$IH/o" "unknown part 'nonsense'"
-    check "prompt: and the next answer is used" has "$LGI" "parts kept: x11 wayland dbus process$"
+    check "prompt: and the next answer is used" has "$LGI" "parts kept: x11 wayland dbus process ddc$"
     newhome
     printf '\nsystemd\n' | inst2 debian systemd --answers-from-stdin > "$IH/o" 2>&1
     check "prompt: autostart method asked after the parts" test -f "$IH/h/.config/systemd/user/lock-guard.service"
@@ -1136,23 +1143,23 @@ EOF
     check "update: an older upstream version is ignored" has "$UH/o" "up to date"
 
     # a real update
-    mkrelease 1.0.1
+    mkrelease 9.0.1
     chmod -R a+rX "$UH"; [ "$(id -u)" = 0 ] && chown -R 65534:65534 "$UH"
     uinst --check-update > "$UH/o" 2>&1; rc=$?
     check "check-update: a newer release exits 10" test "$rc" = 10
-    check "check-update: says what to run" has "$UH/o" "An update is available: $cur -> 1.0.1"
-    check "check-update: points at the release notes" has "$UH/o" "https://github.com/toillover1337/lock-guard/releases/tag/v1.0.1"
+    check "check-update: says what to run" has "$UH/o" "An update is available: $cur -> 9.0.1"
+    check "check-update: points at the release notes" has "$UH/o" "https://github.com/toillover1337/lock-guard/releases/tag/v9.0.1"
     check "check-update: changes nothing" sh -c "$SH $ULG --version | grep -q 'lock-guard $cur'"
     : | uinst --update > "$UH/o" 2>&1; rc=$?
     check "update: without --yes and without a terminal it refuses" test "$rc" != 0 -a -n "$(grep 'add --yes' "$UH/o")"
     printf 'n\n' | uinst --update --answers-from-stdin > "$UH/o" 2>&1
     check "update: answering n leaves the old version" sh -c "$SH $ULG --version | grep -q 'lock-guard $cur'"
     printf 'y\nn\n' | uinst --update --answers-from-stdin > "$UH/o" 2>&1
-    check "update: answering y installs the new version" sh -c "$SH $ULG --version | grep -q 'lock-guard 1.0.1'"
-    check "update: randr-fix was updated too" sh -c "$SH $UH/h/.local/bin/randr-fix --version | grep -q 'randr-fix 1.0.1'"
-    check "update: downloaded the tag archive over https" has "$UH/serve/curl.calls" "^https://github.com/toillover1337/lock-guard/archive/refs/tags/v1.0.1.tar.gz$"
+    check "update: answering y installs the new version" sh -c "$SH $ULG --version | grep -q 'lock-guard 9.0.1'"
+    check "update: randr-fix was updated too" sh -c "$SH $UH/h/.local/bin/randr-fix --version | grep -q 'randr-fix 9.0.1'"
+    check "update: downloaded the tag archive over https" has "$UH/serve/curl.calls" "^https://github.com/toillover1337/lock-guard/archive/refs/tags/v9.0.1.tar.gz$"
     check "update: the earlier parts choice was repeated (still no wayland)" sh -c "! grep -q '^#@@ begin wayland' $ULG"
-    check "update: the record shows the new version" has "$UH/h/.config/screen-guard/install.conf" "^VERSION=1.0.1$"
+    check "update: the record shows the new version" has "$UH/h/.config/screen-guard/install.conf" "^VERSION=9.0.1$"
     check "update: the old scripts are kept for rollback" sh -c "grep -q '^VERSION=$cur\$' $UH/h/.config/screen-guard/previous/lock-guard"
     check "update: the restart question was asked and declined" has "$UH/o" "Restart later with"
     check "update: configs untouched (no config created twice)" sh -c "test -s $UH/h/.config/lock-guard/config"
@@ -1162,7 +1169,7 @@ EOF
     printf 'SESSION=wayland\n' > "$UH/h/.config/lock-guard/config"; [ "$(id -u)" = 0 ] && chown 65534:65534 "$UH/h/.config/lock-guard/config"
     # shellcheck disable=SC2086
     env -i HOME="$UH/h" PATH="$ORIGPATH" XDG_RUNTIME_DIR="$UH/h" $SH "$ULG" --start > /dev/null 2>&1
-    mkrelease 1.0.2; chmod -R a+rX "$UH"; [ "$(id -u)" = 0 ] && chown -R 65534:65534 "$UH"
+    mkrelease 9.0.2; chmod -R a+rX "$UH"; [ "$(id -u)" = 0 ] && chown -R 65534:65534 "$UH"
     UR="$UH/h" uinst --update --yes > "$UH/o" 2>&1
     check "update --yes: restarts the running program on its own" has "$UH/o" "lock-guard started"
     # shellcheck disable=SC2086
@@ -1170,27 +1177,27 @@ EOF
 
     # things that must be refused
     newuh; uinst --yes --autostart none > /dev/null 2>&1
-    mkrelease 1.0.3
-    sed 's/^VERSION=1.0.3$/VERSION=1.0.0/' "$UH/rel/lock-guard-1.0.3/lock-guard" > "$UH/t" && cp "$UH/t" "$UH/rel/lock-guard-1.0.3/lock-guard"
+    mkrelease 9.0.3
+    sed 's/^VERSION=9.0.3$/VERSION=1.0.0/' "$UH/rel/lock-guard-9.0.3/lock-guard" > "$UH/t" && cp "$UH/t" "$UH/rel/lock-guard-9.0.3/lock-guard"
     tar czf "$UH/serve/release.tar.gz" -C "$UH/rel" .; chmod -R a+rX "$UH"; [ "$(id -u)" = 0 ] && chown -R 65534:65534 "$UH"
     uinst --update --yes > "$UH/o" 2>&1; rc=$?
-    check "refuse: a script whose own version differs from the announced one" test "$rc" != 0 -a -n "$(grep 'does not carry version 1.0.3' "$UH/o")"
+    check "refuse: a script whose own version differs from the announced one" test "$rc" != 0 -a -n "$(grep 'does not carry version 9.0.3' "$UH/o")"
     check "refuse: and nothing was installed" sh -c "$SH $ULG --version | grep -q 'lock-guard $cur'"
 
-    mkrelease 1.0.3
-    printf 'if then\n' > "$UH/rel/lock-guard-1.0.3/randr-fix"
-    sed -i "s/^VERSION=.*//" "$UH/rel/lock-guard-1.0.3/randr-fix"
+    mkrelease 9.0.3
+    printf 'if then\n' > "$UH/rel/lock-guard-9.0.3/randr-fix"
+    sed -i "s/^VERSION=.*//" "$UH/rel/lock-guard-9.0.3/randr-fix"
     tar czf "$UH/serve/release.tar.gz" -C "$UH/rel" .; chmod -R a+rX "$UH"; [ "$(id -u)" = 0 ] && chown -R 65534:65534 "$UH"
     uinst --update --yes > "$UH/o" 2>&1; rc=$?
     check "refuse: a script that is not valid shell" test "$rc" != 0 -a -n "$(grep 'not valid shell' "$UH/o")"
 
-    mkrelease 1.0.3
-    echo 9.9.9 > "$UH/rel/lock-guard-1.0.3/VERSION"
+    mkrelease 9.0.3
+    echo 9.9.9 > "$UH/rel/lock-guard-9.0.3/VERSION"
     tar czf "$UH/serve/release.tar.gz" -C "$UH/rel" .; chmod -R a+rX "$UH"; [ "$(id -u)" = 0 ] && chown -R 65534:65534 "$UH"
     uinst --update --yes > "$UH/o" 2>&1; rc=$?
     check "refuse: a VERSION file that disagrees" test "$rc" != 0 -a -n "$(grep "says it is version '9.9.9'" "$UH/o")"
 
-    mkrelease 1.0.3
+    mkrelease 9.0.3
     mkdir -p "$UH/evil"; echo x > "$UH/evil/x"
     tar czf "$UH/serve/release.tar.gz" -C "$UH/rel" . -C "$UH/evil" --transform 's,^x$,../escape,' x 2>/dev/null ||
         tar czf "$UH/serve/release.tar.gz" -C "$UH/rel" .
@@ -1201,13 +1208,13 @@ EOF
         uinst --update --yes > "$UH/o" 2>&1; rc=$?
         check "refuse: an archive with .. in a path" test "$rc" != 0 -a -n "$(grep 'unsafe paths' "$UH/o")"
     fi
-    newuh; uinst --yes --autostart none > /dev/null 2>&1; echo "1.0.3" > "$UH/serve/VERSION"
+    newuh; uinst --yes --autostart none > /dev/null 2>&1; echo "9.0.3" > "$UH/serve/VERSION"
 
     printf 'this is not a tarball\n' > "$UH/serve/release.tar.gz"; chmod a+r "$UH/serve/release.tar.gz"
     uinst --update --yes > "$UH/o" 2>&1; rc=$?
     check "refuse: a download that is not an archive" test "$rc" != 0 -a -n "$(grep 'not a valid archive' "$UH/o")"
 
-    echo "1.0.3" > "$UH/serve/VERSION"; : > "$UH/serve/offline"; chmod a+r "$UH/serve/offline"
+    echo "9.0.3" > "$UH/serve/VERSION"; : > "$UH/serve/offline"; chmod a+r "$UH/serve/offline"
     uinst --check-update > "$UH/o" 2>&1; rc=$?
     check "offline: check-update fails clearly (exit 1)" test "$rc" = 1 -a -n "$(grep 'could not reach' "$UH/o")"
     rm -f "$UH/serve/offline"
@@ -1216,7 +1223,7 @@ EOF
     uinst --check-update > "$UH/o" 2>&1; rc=$?
     check "garbage: a VERSION file that is not a version is rejected" test "$rc" = 1 -a -n "$(grep 'could not be read' "$UH/o")"
 
-    echo "1.0.3" > "$UH/serve/VERSION"
+    echo "9.0.3" > "$UH/serve/VERSION"
     # (skipped where the shell has wget built in, e.g. busybox sh: it would find it whatever PATH says)
     case $SH in *busybox*) NODL_SKIP=1 ;; *) NODL_SKIP=0 ;; esac
     if [ "$NODL_SKIP" = 0 ]; then
@@ -1353,7 +1360,7 @@ mkdir "$TMP/pruned"
 awk '/^#@@ begin wayland$/ { skip = 1; next } /^#@@ end wayland$/ { skip = 0; next } !skip' "$ROOT/lock-guard" > "$TMP/pruned/lock-guard"
 # shellcheck disable=SC2086   # $SH may be two words, e.g. "busybox sh"
 check "pruned copy: syntax is valid" $SH -n "$TMP/pruned/lock-guard"
-check "pruned copy: status lists what is left" sh -c "$SH $TMP/pruned/lock-guard --status | grep -q 'in this copy: x11 dbus process'"
+check "pruned copy: status lists what is left" sh -c "$SH $TMP/pruned/lock-guard --status | grep -q 'in this copy: x11 dbus process ddc'"
 printf 'signal time=1 member=ActiveChanged\n   boolean true\n' > "$STUB/dbus.script"
 $SH "$TMP/pruned/lock-guard" >/dev/null 2>&1 &
 sleep 2
@@ -1368,6 +1375,236 @@ kill "$(cat "$RD/lock-guard.pid")"; sleep 1
 rm -f "$STUB/locker.running"
 awk '/^#@@ begin (dbus|process)$/ { skip = 1; next } /^#@@ end (dbus|process)$/ { skip = 0; next } !skip' "$ROOT/lock-guard" > "$TMP/pruned/lg2"
 check "pruned copy: a lock source that was removed is reported" sh -c "printf 'SESSION=x11\n' > $XDG_CONFIG_HOME/lock-guard/config; $SH $TMP/pruned/lg2 2>&1 | grep -q \"lock detection 'dbus' is not in this copy\""
+done_with
+
+
+# ============================================================ real backlight (stubbed ddcutil)
+mkddc() {   # a fake ddcutil in this test's PATH; monitor state lives in $STUB/ddc.*
+    cat > "$TMP/bin/ddcutil" <<'EOF'
+#!/bin/sh
+# usage seen: detect --brief | --bus N getvcp 10 --brief | --bus N setvcp 10 V --noverify
+bus=; cmd=; pos=0; code=; val=
+while [ $# -gt 0 ]; do
+    case $1 in
+        --bus) bus=$2; shift ;;
+        --sleep-multiplier) shift ;;
+        --brief|--noverify) ;;
+        detect|getvcp|setvcp) cmd=$1 ;;
+        *) pos=$((pos + 1)); if [ "$pos" = 1 ]; then code=$1; else val=$1; fi ;;
+    esac
+    shift
+done
+echo "$cmd bus=$bus $code $val" >> "$STUB/ddc.log"
+case $cmd in
+    detect) cat "$STUB/ddc.detect" ;;
+    getvcp|setvcp)
+        [ -f "$STUB/ddc.nobus.$bus" ] && exit 1
+        if [ -f "$STUB/ddc.sleep.$bus" ]; then
+            n=$(cat "$STUB/ddc.sleep.$bus")
+            if [ "$n" -gt 0 ]; then echo $((n - 1)) > "$STUB/ddc.sleep.$bus"; exit 1; fi
+        fi
+        if [ "$cmd" = getvcp ]; then
+            echo "VCP 10 C $(cat "$STUB/ddc.val.$bus" 2>/dev/null || echo 70) $(cat "$STUB/ddc.max.$bus" 2>/dev/null || echo 100)"
+        else
+            echo "$val" > "$STUB/ddc.val.$bus"
+        fi ;;
+esac
+EOF
+    chmod +x "$TMP/bin/ddcutil"
+    cat > "$STUB/ddc.detect" <<'EOF'
+Display 1
+   I2C bus:  /dev/i2c-11
+   Monitor:             ACR:Acer XFA240:
+
+Invalid display
+   I2C bus:  /dev/i2c-9
+   EDID synopsis:
+      Mfg id:               XXX
+
+Display 2
+   I2C bus:  /dev/i2c-14
+   Monitor:             ACR:Acer GN246HL:LW3AA0018532
+EOF
+    echo 70 > "$STUB/ddc.val.11"; echo 55 > "$STUB/ddc.val.14"
+}
+lockon()  { touch "$STUB/locker.running"; }
+lockoff() { rm -f "$STUB/locker.running"; }
+val() { cat "$STUB/ddc.val.$1" 2>/dev/null; }
+
+# --- dim and restore, both monitors found by detect, the invalid one skipped
+fresh; mkddc
+printf 'SESSION=wayland\nLOCK_BACKLIGHT=20\n' > "$XDG_CONFIG_HOME/lock-guard/config"
+lg >/dev/null 2>&1 &
+sleep 2
+check "backlight: monitors are looked up when lock-guard starts" test "$(grep -c '^detect' "$STUB/ddc.log")" = 1
+lockon; sleep 4
+check "backlight: monitor on bus 11 lowered to 20" test "$(val 11)" = 20
+check "backlight: monitor on bus 14 lowered to 20" test "$(val 14)" = 20
+check "backlight: the invalid display (bus 9) is never touched" hasnt "$STUB/ddc.log" "bus=9 "
+check "backlight: log says what changed" has "$RD/lock-guard.log" "backlight: bus 11 70 -> 20 (of 100)"
+check "backlight: the old values are saved" same "$RD/backlight-state" "11 70 100
+14 55 100"
+check "backlight: no gamma tools were used" test ! -e "$STUB/xrandr.calls" -a ! -e "$STUB/busctl.calls"
+check "backlight: --status shows it is lowered" sh -c "$SH $ROOT/lock-guard --status | grep -q 'backlight is lowered now'"
+lockoff; sleep 4
+check "backlight: bus 11 put back to 70" test "$(val 11)" = 70
+check "backlight: bus 14 put back to 55" test "$(val 14)" = 55
+check "backlight: state removed after the restore" test ! -e "$RD/backlight-state"
+check "backlight: logged" has "$RD/lock-guard.log" "backlight restored"
+check "backlight: detect ran only once for the whole session" test "$(grep -c '^detect' "$STUB/ddc.log")" = 1
+lockon; sleep 4; lockoff; sleep 4
+check "backlight: a second lock works the same" test "$(val 11)" = 70 -a "$(grep -c 'bus 11 70 -> 20' "$RD/lock-guard.log")" = 2
+kill "$(cat "$RD/lock-guard.pid")"; sleep 1
+done_with
+
+# --- percentage maths, monitors already dimmer than the target, a monitor that cannot be read
+fresh; mkddc
+echo 255 > "$STUB/ddc.max.11"; echo 200 > "$STUB/ddc.val.11"; echo 15 > "$STUB/ddc.val.14"
+printf 'SESSION=wayland\nLOCK_BACKLIGHT=33\n' > "$XDG_CONFIG_HOME/lock-guard/config"
+lg >/dev/null 2>&1 &
+sleep 2; lockon; sleep 4
+check "backlight: 33% of a maximum of 255 is 84" test "$(val 11)" = 84
+check "backlight: a monitor already below the target is left alone" test "$(val 14)" = 15
+check "backlight: and says so" has "$RD/lock-guard.log" "bus 14 is already at 15"
+check "backlight: and is not in the saved state" hasnt "$RD/backlight-state" "^14 "
+lockoff; sleep 4
+check "backlight: restored to the original value on a different scale" test "$(val 11)" = 200
+kill "$(cat "$RD/lock-guard.pid")"; sleep 1
+done_with
+
+fresh; mkddc
+touch "$STUB/ddc.nobus.11"
+printf 'SESSION=wayland\nLOCK_BACKLIGHT=20\n' > "$XDG_CONFIG_HOME/lock-guard/config"
+lg >/dev/null 2>&1 &
+sleep 2; lockon; sleep 4
+check "backlight: an unreadable monitor is reported" has "$RD/lock-guard.log" "bus 11: cannot read the brightness"
+check "backlight: the other monitor is still handled" test "$(val 14)" = 20
+lockoff; sleep 3
+check "backlight: and restored" test "$(val 14)" = 55
+kill "$(cat "$RD/lock-guard.pid")"; sleep 1
+done_with
+
+# --- BACKLIGHT_BUSES skips detection and limits the monitors; DDCUTIL_OPTIONS is passed on
+fresh; mkddc
+printf 'SESSION=wayland\nLOCK_BACKLIGHT=20\nBACKLIGHT_BUSES=14\nDDCUTIL_OPTIONS=--sleep-multiplier .5\n' > "$XDG_CONFIG_HOME/lock-guard/config"
+lg >/dev/null 2>&1 &
+sleep 2; lockon; sleep 4
+check "backlight: only the listed bus is lowered" test "$(val 14)" = 20 -a "$(val 11)" = 70
+check "backlight: detect is not needed when the buses are given" hasnt "$STUB/ddc.log" "^detect"
+lockoff; sleep 3
+check "backlight: the listed bus is restored" test "$(val 14)" = 55
+kill "$(cat "$RD/lock-guard.pid")"; sleep 1
+done_with
+
+# --- a monitor that is asleep at unlock is retried
+fresh; mkddc
+printf 'SESSION=wayland\nLOCK_BACKLIGHT=20\nBACKLIGHT_BUSES=11\n' > "$XDG_CONFIG_HOME/lock-guard/config"
+BL_RETRY_SLEEP=1 lg >/dev/null 2>&1 &
+sleep 2; lockon; sleep 4
+echo 3 > "$STUB/ddc.sleep.11"
+lockoff; sleep 7
+check "backlight: restored once the monitor answers" test "$(val 11)" = 70
+check "backlight: the failed tries did not lose the saved value" test ! -e "$RD/backlight-state"
+check "backlight: and it was tried more than once" test "$(grep -c 'setvcp bus=11 10 70' "$STUB/ddc.log")" -ge 2
+kill "$(cat "$RD/lock-guard.pid")"; sleep 1
+done_with
+
+# --- stopping while locked puts the backlight back; a crash is repaired at the next start
+fresh; mkddc
+printf 'SESSION=wayland\nLOCK_BACKLIGHT=20\nBACKLIGHT_BUSES=11 14\n' > "$XDG_CONFIG_HOME/lock-guard/config"
+lg >/dev/null 2>&1 &
+sleep 2; lockon; sleep 4
+check "backlight: lowered while locked" test "$(val 11)" = 20
+kill "$(cat "$RD/lock-guard.pid")"; sleep 3
+check "backlight: stopping lock-guard restores it" test "$(val 11)" = 70 -a "$(val 14)" = 55
+done_with
+
+fresh; mkddc
+echo 20 > "$STUB/ddc.val.11"; mkdir -p "$RD"; chmod 700 "$RD"; printf '11 70 100\n' > "$RD/backlight-state"
+printf 'SESSION=wayland\nLOCK_BACKLIGHT=20\nBACKLIGHT_BUSES=11\n' > "$XDG_CONFIG_HOME/lock-guard/config"
+lg >/dev/null 2>&1 &
+sleep 3
+check "backlight: a state left by a crash is repaired at start" test "$(val 11)" = 70 -a ! -e "$RD/backlight-state"
+kill "$(cat "$RD/lock-guard.pid")"; sleep 1
+done_with
+
+# --- lock-guard --undim and --enable restore it from another process
+fresh; mkddc
+printf 'SESSION=wayland\nLOCK_BACKLIGHT=20\nBACKLIGHT_BUSES=11\n' > "$XDG_CONFIG_HOME/lock-guard/config"
+lg >/dev/null 2>&1 &
+sleep 2; lockon; sleep 4
+lg --undim >/dev/null 2>&1
+check "backlight: --undim puts it back while still locked" test "$(val 11)" = 70
+lockoff; sleep 3
+kill "$(cat "$RD/lock-guard.pid")"; sleep 1
+done_with
+
+# --- a quick lock and unlock cannot cross over in the worker
+fresh; mkddc
+printf 'SESSION=wayland\nLOCK_BACKLIGHT=20\nBACKLIGHT_BUSES=11\n' > "$XDG_CONFIG_HOME/lock-guard/config"
+lg >/dev/null 2>&1 &
+sleep 2; lockon; sleep 1; lockoff; sleep 7
+check "backlight: lock then unlock a second later ends restored" test "$(val 11)" = 70 -a ! -e "$RD/backlight-state"
+kill "$(cat "$RD/lock-guard.pid")"; sleep 1
+done_with
+
+# --- together with gamma dimming, and with the early undim shortcut (backlight only)
+fresh; mkddc
+printf 'SESSION=wayland\nLOCK_BACKLIGHT=20\nBACKLIGHT_BUSES=11\nLOCK_BRIGHTNESS=0.3\n' > "$XDG_CONFIG_HOME/lock-guard/config"
+lg >/dev/null 2>&1 &
+sleep 2; lockon; sleep 4
+check "backlight + gamma: both lowered" test "$(val 11)" = 20 -a "$(cat "$STUB/gamma" 2>/dev/null)" = 0.3
+lockoff; sleep 4
+check "backlight + gamma: both restored" test "$(val 11)" = 70 -a "$(cat "$STUB/gamma")" = 1
+kill "$(cat "$RD/lock-guard.pid")"; sleep 1
+done_with
+
+fresh; mkddc
+printf 'SESSION=wayland\nLOCK_BACKLIGHT=20\nBACKLIGHT_BUSES=11\nUNDIM_KEY=Ctrl+Shift+b\n' > "$XDG_CONFIG_HOME/lock-guard/config"
+{ lik KEY_LEFTCTRL 29 pressed; lik KEY_LEFTSHIFT 42 pressed; lik KEY_B 48 pressed; } > "$STUB/li.script"
+lg >/dev/null 2>&1 &
+sleep 2; lockon; sleep 5
+check "backlight: the early undim shortcut also works for the backlight alone" test "$(val 11)" = 70
+check "backlight: and was logged" has "$RD/lock-guard.log" "undim key pressed"
+lockoff; sleep 3
+kill "$(cat "$RD/lock-guard.pid")"; sleep 1
+done_with
+
+# --- configuration checks and a copy without the part
+fresh
+for bad in 0 101 abc 20% -5 2.5; do
+    printf 'LOCK_BACKLIGHT=%s\n' "$bad" > "$XDG_CONFIG_HOME/lock-guard/config"
+    check "backlight: LOCK_BACKLIGHT=$bad is refused" sh -c "$SH $ROOT/lock-guard --status 2>&1 | grep -q 'LOCK_BACKLIGHT must be'"
+done
+printf 'LOCK_BACKLIGHT=20\nBACKLIGHT_BUSES=11;rm\n' > "$XDG_CONFIG_HOME/lock-guard/config"
+check "backlight: BACKLIGHT_BUSES with shell characters is refused" sh -c "$SH $ROOT/lock-guard --status 2>&1 | grep -q 'BACKLIGHT_BUSES must be'"
+# shellcheck disable=SC2016   # the text is meant literally
+printf 'LOCK_BACKLIGHT=20\nDDCUTIL_OPTIONS=$(touch x)\n' > "$XDG_CONFIG_HOME/lock-guard/config"
+check "backlight: DDCUTIL_OPTIONS with shell characters is refused" sh -c "$SH $ROOT/lock-guard --status 2>&1 | grep -q 'DDCUTIL_OPTIONS may only'"
+for ok in 1 20 100; do
+    printf 'LOCK_BACKLIGHT=%s\n' "$ok" > "$XDG_CONFIG_HOME/lock-guard/config"
+    check "backlight: LOCK_BACKLIGHT=$ok is accepted" sh -c "! $SH $ROOT/lock-guard --status 2>&1 | grep -q 'LOCK_BACKLIGHT must be'"
+done
+done_with
+
+fresh; mkddc
+mkdir "$TMP/pruned"
+awk '/^#@@ begin ddc$/ { skip = 1; next } /^#@@ end ddc$/ { skip = 0; next } !skip' "$ROOT/lock-guard" > "$TMP/pruned/lock-guard"
+# shellcheck disable=SC2086
+check "backlight: a copy without the ddc part is valid shell" $SH -n "$TMP/pruned/lock-guard"
+printf 'SESSION=wayland\nLOCK_BACKLIGHT=20\nBACKLIGHT_BUSES=11\n' > "$XDG_CONFIG_HOME/lock-guard/config"
+$SH "$TMP/pruned/lock-guard" >/dev/null 2>&1 &
+sleep 2; lockon; sleep 3
+check "backlight: a copy without the ddc part says so in the log" has "$RD/lock-guard.log" "this copy has no ddc part"
+check "backlight: and leaves the monitors alone" test "$(val 11)" = 70
+check "backlight: and keeps running" kill -0 "$(cat "$RD/lock-guard.pid")"
+check "backlight: --status explains" sh -c "$SH $TMP/pruned/lock-guard --status | grep -q 'no ddc part'"
+lockoff; kill "$(cat "$RD/lock-guard.pid")"; sleep 1
+done_with
+
+fresh; mkddc
+printf 'SESSION=wayland\nLOCK_BACKLIGHT=20\nBACKLIGHT_BUSES=11\n' > "$XDG_CONFIG_HOME/lock-guard/config"
+check "backlight: --status reads the brightness now" sh -c "$SH $ROOT/lock-guard --status | grep -q 'backlight now: bus11=70/100'"
 done_with
 
 printf '\n%s passed, %s failed\n' "$PASS" "$FAIL"

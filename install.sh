@@ -3,7 +3,7 @@
 #   ./install.sh                  detect this machine, show what it found, ask what to install
 #   ./install.sh --list           only show what was detected
 #   ./install.sh --yes            accept the detected defaults without asking
-#   ./install.sh --variants LIST  keep exactly these parts: x11 wayland dbus process (or "all")
+#   ./install.sh --variants LIST  keep exactly these parts: x11 wayland dbus process ddc (or "all")
 #   ./install.sh --autostart M    start at login via: xdg (default), systemd, shepherd, none
 #   ./install.sh --prefix DIR     install to DIR/bin instead of ~/.local/bin
 #   ./install.sh --no-autostart   same as --autostart none
@@ -17,7 +17,7 @@
 # you have (default) and removes the rest from the installed copy; the program still picks the
 # right part each time it starts, so one install serves an X11 and a Wayland session alike.
 
-VERSION=1.0.0
+VERSION=1.1.0
 set -u
 HERE=$(cd "$(dirname "$0")" && pwd)
 PREFIX=${PREFIX:-${HOME:-}/.local}
@@ -27,7 +27,7 @@ AUTOSTART_SET=0
 ACTION=install
 SCRIPTS="lock-guard randr-fix"
 CONFHOME=${XDG_CONFIG_HOME:-${HOME:-}/.config}
-ALL_VARIANTS="x11 wayland dbus process"
+ALL_VARIANTS="x11 wayland dbus process ddc"
 VARIANTS=auto
 YES=0
 ASK_STDIN=0
@@ -278,6 +278,7 @@ detect_env() {
     # the session this script runs in counts too
     if [ -n "${WAYLAND_DISPLAY:-}" ]; then WL_FOUND=1; elif [ -n "${DISPLAY:-}" ]; then X11_FOUND=1; fi
     HAVE_DBUSMON=0; has_cmd dbus-monitor && HAVE_DBUSMON=1
+    HAVE_DDCUTIL=0; has_cmd ddcutil && HAVE_DDCUTIL=1
 }
 
 yesno() { if [ "$1" = 1 ]; then echo yes; else echo no; fi; }
@@ -301,6 +302,7 @@ default_variants() {
     [ "$WL_FOUND" = 1 ] && _dv="$_dv wayland"
     [ "$HAVE_DBUSMON" = 1 ] && _dv="$_dv dbus"
     if [ "$WL_FOUND" = 1 ] || [ "$HAVE_DBUSMON" = 0 ]; then _dv="$_dv process"; fi
+    [ "$HAVE_DDCUTIL" = 1 ] && _dv="$_dv ddc"
     echo "${_dv# }"
 }
 
@@ -310,6 +312,7 @@ why_variant() {
         wayland) echo "Wayland sessions: wl-gammarelay-rs / libinput / your own commands" ;;
         dbus) echo "lock noticed over D-Bus (Xfce, GNOME, KDE ...)" ;;
         process) echo "lock noticed by its locker process (swaylock, gtklock ...)" ;;
+        ddc) echo "lower the monitors' real backlight over DDC/CI (needs ddcutil)" ;;
     esac
 }
 
@@ -621,12 +624,20 @@ miss=
 case " $KEEP " in *" x11 "*) for c in awk xrandr xset xinput xev xprop wmctrl; do has_cmd "$c" || miss="$miss $c"; done ;; esac
 case " $KEEP " in *" dbus "*) has_cmd dbus-monitor || miss="$miss dbus-monitor" ;; esac
 case " $KEEP " in *" process "*) has_cmd pgrep || miss="$miss pgrep" ;; esac
+case " $KEEP " in *" ddc "*) has_cmd ddcutil || miss="$miss ddcutil" ;; esac
 has_cmd awk || miss="$miss awk"
 [ -z "$miss" ] || echo "Missing tools:$miss  (see README.md for the package names)"
 case " $KEEP " in
     *" wayland "*)
         has_cmd busctl || echo "Wayland dimming: busctl not found (wl-gammarelay-rs needs it; or set DIM_COMMAND / UNDIM_COMMAND)"
         has_cmd libinput || echo "Wayland UNDIM_KEY: libinput not found (package libinput-tools / libinput-utils; also needs the 'input' group)" ;;
+esac
+case " $KEEP " in
+    *" ddc "*)
+        if has_cmd ddcutil; then
+            case " $(id -nG 2>/dev/null) " in *" i2c "*) ;; *) echo "Backlight: you are not in the 'i2c' group, which ddcutil usually needs (log in again after adding yourself)." ;; esac
+            [ -e /dev/i2c-0 ] || [ -n "$(ls /dev/i2c-* 2>/dev/null)" ] || echo "Backlight: no /dev/i2c-* devices yet - load the i2c-dev kernel module (modprobe i2c-dev)."
+        fi ;;
 esac
 case :${PATH:-}: in *:"$BIN":*) ;; *) echo "Note: $BIN is not in your PATH." ;; esac
 echo "Start now (or log out and in):"

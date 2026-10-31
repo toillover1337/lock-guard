@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.1.0 - 2026-10
+
+- New optional `ddc` part: `LOCK_BACKLIGHT` lowers the monitors' real backlight over DDC/CI
+  (`ddcutil`) on lock and restores each monitor's saved value at unlock, on X11 and Wayland.
+  `BACKLIGHT_BUSES` and `DDCUTIL_OPTIONS` choose monitors and options. Runs in an ordered
+  background worker, retries the restore while a monitor sleeps, repairs a crash at the next start.
+- `UNDIM_KEY` and `lock-guard --undim` restore the backlight as well.
+- The installer offers `ddc` (kept by default when `ddcutil` is installed) and checks the
+  `i2c` group and `/dev/i2c-*`.
+
 ## 1.0.0 - 2026-10
 
 First public release.

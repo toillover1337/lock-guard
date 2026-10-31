@@ -8,11 +8,11 @@
 # starts (SESSION, LOCK_DETECT); install.sh can remove blocks you do not need.
 #   x11      needs: xinput, xrandr, xset, wmctrl, xprop, awk   (xmodmap optional)
 #   wayland  needs: awk; optional: wl-gammarelay-rs + busctl (dimming), libinput (UNDIM_KEY)
-#   dbus     needs: dbus-monitor      process  needs: pgrep
+#   dbus     needs: dbus-monitor      process  needs: pgrep      ddc  needs: ddcutil (real backlight)
 # Optional everywhere: stdbuf (GNU coreutils), timeout.
 
 NAME=lock-guard
-VERSION=1.0.0
+VERSION=1.1.0
 SIBLING=randr-fix
 CONF_WARN=
 set -u
@@ -28,6 +28,9 @@ HOOK_TIMEOUT=20
 LOCK_BRIGHTNESS=
 DIM_OUTPUTS=
 UNDIM_KEY=
+LOCK_BACKLIGHT=
+BACKLIGHT_BUSES=
+DDCUTIL_OPTIONS=
 SESSION=auto
 LOCK_DETECT=auto
 LOCKER_PROCESSES="swaylock gtklock hyprlock waylock i3lock slock xsecurelock"
@@ -120,6 +123,23 @@ DIM_OUTPUTS=$DIM_OUTPUTS
 # no other key is stored, logged or passed on.  Leave it empty if you do not want that.
 UNDIM_KEY=$UNDIM_KEY
 
+# Lower the monitors' real backlight while the screen is locked, through DDC/CI (needs ddcutil, the
+# i2c-dev kernel module and membership of the i2c group).  A whole number from 1 to 100: the
+# percentage of each monitor's maximum brightness; empty = leave the backlight alone.  It can be
+# used together with LOCK_BRIGHTNESS or instead of it, on X11 and on Wayland.  What each monitor
+# had is saved and put back at unlock (retried for about 30 seconds if the monitor is asleep).
+# Each DDC call takes about a second and runs in the background.  Some monitors keep the setting in
+# memory that wears out, so this is meant for a few changes a day, not hundreds.
+LOCK_BACKLIGHT=$LOCK_BACKLIGHT
+
+# Which monitors, as the I2C bus numbers shown by 'ddcutil detect' ("I2C bus: /dev/i2c-11" is 11),
+# space separated.  Empty = every monitor ddcutil finds (looked up once, when lock-guard starts).
+BACKLIGHT_BUSES=$BACKLIGHT_BUSES
+
+# Extra options for every ddcutil call, for example --sleep-multiplier .5 to make it faster on
+# monitors that cope.  Letters, digits, spaces and . = _ - only.
+DDCUTIL_OPTIONS=$DDCUTIL_OPTIONS
+
 # ---- environment -------------------------------------------------------------------------------
 # Which kind of session this is: auto (decided each time lock-guard starts: Wayland if the
 # session says so, else X11), x11 or wayland.  One install can serve both an X11 desktop and a
@@ -204,6 +224,10 @@ setup_rundir() {
     KEEPFILE=$RUNDIR/dim-keeper
     KEYFIFO=$RUNDIR/undim-key.fifo
     KEYPIDS=$RUNDIR/undim-key.pids
+    BLSTATE=$RUNDIR/backlight-state
+    BLLOCK=$RUNDIR/backlight.lock
+    BLBUSES=$RUNDIR/backlight-buses
+    BLFIFO=$RUNDIR/backlight.fifo
 }
 
 log() {
@@ -228,7 +252,8 @@ load_conf() {
         case $_k in
             LOCK_DEVICE_PATTERN|DISABLE_INPUT|SAVE_WINDOWS|SCREENSAVER_INTERFACES|\
             LOCK_COMMAND|UNLOCK_COMMAND|HOOK_TIMEOUT|LOCK_BRIGHTNESS|DIM_OUTPUTS|UNDIM_KEY|\
-            SESSION|LOCK_DETECT|LOCKER_PROCESSES|INPUT_OFF_COMMAND|INPUT_ON_COMMAND|DIM_COMMAND|UNDIM_COMMAND) eval "$_k=\$_v" ;;
+            SESSION|LOCK_DETECT|LOCKER_PROCESSES|INPUT_OFF_COMMAND|INPUT_ON_COMMAND|DIM_COMMAND|UNDIM_COMMAND|\
+            LOCK_BACKLIGHT|BACKLIGHT_BUSES|DDCUTIL_OPTIONS) eval "$_k=\$_v" ;;
             *)
                 warn "$CONF: ignoring unknown key '$_k'"
                 CONF_WARN="${CONF_WARN:+$CONF_WARN; }unknown key '$_k' ignored"
@@ -247,11 +272,17 @@ load_conf() {
         awk -v b="$LOCK_BRIGHTNESS" 'BEGIN { exit !(b >= 0.05 && b <= 1) }' ||
             die "$CONF: LOCK_BRIGHTNESS must be a number from 0.05 to 1.0"
     fi
+    if [ -n "$LOCK_BACKLIGHT" ]; then
+        case $LOCK_BACKLIGHT in ''|*[!0-9]*) die "$CONF: LOCK_BACKLIGHT must be a whole number from 1 to 100" ;; esac
+        { [ "$LOCK_BACKLIGHT" -ge 1 ] && [ "$LOCK_BACKLIGHT" -le 100 ]; } || die "$CONF: LOCK_BACKLIGHT must be a whole number from 1 to 100"
+    fi
+    case $BACKLIGHT_BUSES in *[!0-9\ ,]*) die "$CONF: BACKLIGHT_BUSES must be I2C bus numbers separated by spaces" ;; esac
+    case $DDCUTIL_OPTIONS in *[!A-Za-z0-9\ .=_-]*) die "$CONF: DDCUTIL_OPTIONS may only hold letters, digits, spaces and . = _ -" ;; esac
     if [ -n "$UNDIM_KEY" ]; then
         case $UNDIM_KEY in
             *[!A-Za-z0-9_+]*|+*|*+|*++*) die "$CONF: UNDIM_KEY must look like Ctrl+Shift+b (key names or numbers joined with +)" ;;
         esac
-        [ -n "$LOCK_BRIGHTNESS" ] || warn "$CONF: UNDIM_KEY does nothing without LOCK_BRIGHTNESS"
+        [ -n "$LOCK_BRIGHTNESS$LOCK_BACKLIGHT" ] || warn "$CONF: UNDIM_KEY does nothing without LOCK_BRIGHTNESS or LOCK_BACKLIGHT"
     fi
 }
 
@@ -280,6 +311,7 @@ backends_present() {
     command -v wayland_set_input >/dev/null 2>&1 && _bp="$_bp wayland"
     command -v src_dbus >/dev/null 2>&1 && _bp="$_bp dbus"
     command -v src_process >/dev/null 2>&1 && _bp="$_bp process"
+    command -v ddc_dim >/dev/null 2>&1 && _bp="$_bp ddc"
     echo "${_bp# }"
 }
 
@@ -601,8 +633,7 @@ dim_screens() {
     return 0
 }
 
-undim_screens() {
-    undim_key_stop
+undim_gamma() {
     [ -f "$DIMFILE" ] || return 0
     dim_lock
     if [ -f "$DIMFILE" ]; then
@@ -616,6 +647,178 @@ undim_screens() {
     fi
     dim_unlock
     return 0
+}
+
+# $1 = tries for the backlight (default 1)
+undim_screens() {
+    undim_key_stop
+    undim_gamma
+    bl_undim_now "${1:-1}"
+    return 0
+}
+
+# the unlock path: the slow backlight restore goes to the worker
+undim_screens_queued() {
+    undim_key_stop
+    undim_gamma
+    bl_send undim
+    return 0
+}
+
+# ------------------------------------------------------------ real backlight (DDC/CI)
+# Lowers the monitors' own backlight through ddcutil (VCP code 10), whatever the session is.
+# Slow calls (about a second each) run in a worker that handles "dim" and "undim" strictly in
+# order, so locking and unlocking are never held up and a quick lock+unlock cannot cross over.
+# What each monitor had is written to $BLSTATE before it is changed; a restart or crash while dimmed
+# is repaired by the next start.
+#@@ begin ddc
+ddc_run() {
+    # shellcheck disable=SC2086   # DDCUTIL_OPTIONS is a list of words
+    if command -v timeout >/dev/null 2>&1; then timeout 20 ddcutil $DDCUTIL_OPTIONS "$@"; else ddcutil $DDCUTIL_OPTIONS "$@"; fi
+}
+
+# I2C bus numbers of the monitors to handle, one per line
+ddc_buses() {
+    if [ -n "$BACKLIGHT_BUSES" ]; then
+        printf '%s\n' "$BACKLIGHT_BUSES" | tr ',' ' ' | tr -s ' ' '\n' | sed '/^$/d'
+        return 0
+    fi
+    if [ ! -s "$BLBUSES" ]; then
+        ddc_run detect --brief 2>/dev/null | awk '
+            /^Display [0-9]+/ { ok = 1; next }
+            /^[A-Za-z]/ { ok = 0 }
+            ok && /I2C bus:/ { n = $NF; sub(/.*i2c-/, "", n); if (n ~ /^[0-9]+$/) print n }' > "$BLBUSES.$$"
+        if [ -s "$BLBUSES.$$" ]; then mv -f "$BLBUSES.$$" "$BLBUSES"; else rm -f "$BLBUSES.$$"; fi
+    fi
+    cat "$BLBUSES" 2>/dev/null
+    return 0
+}
+
+ddc_read() {             # BUS: prints "current max", fails if it cannot be read
+    ddc_run --bus "$1" getvcp 10 --brief 2>/dev/null |
+        awk '$1 == "VCP" && $2 == "10" && $3 == "C" && $4 ~ /^[0-9]+$/ && $5 ~ /^[0-9]+$/ { print $4, $5; f = 1 } END { exit !f }'
+}
+
+ddc_set() { ddc_run --bus "$1" setvcp 10 "$2" --noverify >/dev/null 2>&1; }
+
+bl_lock() {
+    _bt=0
+    until mkdir "$BLLOCK" 2>/dev/null; do
+        _bt=$((_bt + 1))
+        if [ "$_bt" -gt 150 ]; then rmdir "$BLLOCK" 2>/dev/null; _bt=0; fi     # holder died
+        nap
+    done
+}
+
+bl_unlock() { rmdir "$BLLOCK" 2>/dev/null; return 0; }
+
+ddc_dim() {
+    command -v ddcutil >/dev/null 2>&1 || { log "backlight: ddcutil not found"; return 0; }
+    bl_lock
+    if [ ! -f "$BLSTATE" ]; then
+        _buses=$(ddc_buses)
+        if [ -z "$_buses" ]; then
+            log "backlight: no DDC monitors found (is the i2c-dev module loaded, and are you in the i2c group?)"
+        fi
+        for _b in $_buses; do
+            if ! _cm=$(ddc_read "$_b"); then log "backlight: bus $_b: cannot read the brightness"; continue; fi
+            # shellcheck disable=SC2086
+            set -- $_cm
+            _cur=$1; _max=$2
+            _tgt=$(awk -v m="$_max" -v p="$LOCK_BACKLIGHT" 'BEGIN { printf "%d", m * p / 100 + 0.5 }')
+            if [ "$_cur" -le "$_tgt" ]; then
+                log "backlight: bus $_b is already at $_cur (target $_tgt) - left alone"
+                continue
+            fi
+            echo "$_b $_cur $_max" >> "$BLSTATE"
+            if ddc_set "$_b" "$_tgt"; then
+                log "backlight: bus $_b $_cur -> $_tgt (of $_max)"
+            else
+                log "backlight: bus $_b: could not lower the brightness"
+            fi
+        done
+    fi
+    bl_unlock
+    if [ -f "$BLSTATE" ]; then undim_key_start; fi
+    return 0
+}
+
+# put back what is in $BLSTATE; what fails stays there.  Succeeds when nothing is left.
+ddc_restore_once() {
+    [ -f "$BLSTATE" ] || return 0
+    : > "$BLSTATE.left"
+    while read -r _b _cur _max; do
+        case $_b$_cur in ''|*[!0-9]*) continue ;; esac
+        if ddc_set "$_b" "$_cur"; then
+            log "backlight: bus $_b restored to $_cur"
+        else
+            echo "$_b $_cur $_max" >> "$BLSTATE.left"
+        fi
+    done < "$BLSTATE"
+    if [ -s "$BLSTATE.left" ]; then mv -f "$BLSTATE.left" "$BLSTATE"; return 1; fi
+    rm -f "$BLSTATE.left" "$BLSTATE"
+    return 0
+}
+
+# $1 = how many tries (a sleeping monitor does not answer; try again a little later)
+ddc_undim_now() {
+    [ -f "$BLSTATE" ] || return 0
+    command -v ddcutil >/dev/null 2>&1 || { log "backlight: ddcutil not found - cannot restore"; return 0; }
+    _n=${1:-1}
+    while :; do
+        bl_lock
+        ddc_restore_once; _r=$?
+        bl_unlock
+        if [ "$_r" = 0 ]; then log "backlight restored"; return 0; fi
+        _n=$((_n - 1))
+        if [ "$_n" -le 0 ]; then
+            log "backlight: could not restore every monitor yet; kept, to be tried again (lock-guard --enable does it now)"
+            return 0
+        fi
+        sleep "${BL_RETRY_SLEEP:-2}"
+    done
+}
+
+ddc_worker() {
+    while read -r _bw; do
+        case $_bw in
+            dim) ddc_dim ;;
+            undim) undim_key_stop; ddc_undim_now 15 ;;
+        esac
+    done
+}
+
+ddc_prime() { ddc_buses >/dev/null; }
+
+ddc_status() {
+    echo "  LOCK_BACKLIGHT=${LOCK_BACKLIGHT:-<off>}  BACKLIGHT_BUSES=${BACKLIGHT_BUSES:-<all detected>}"
+    [ -n "$LOCK_BACKLIGHT" ] || return 0
+    command -v ddcutil >/dev/null 2>&1 || { echo "  backlight: ddcutil not found"; return 0; }
+    if [ -n "$BACKLIGHT_BUSES" ] || [ -s "$BLBUSES" ]; then
+        _bs=
+        for _b in $(ddc_buses); do
+            if _cm=$(ddc_read "$_b"); then _bs="$_bs bus$_b=${_cm% *}/${_cm#* }"; else _bs="$_bs bus$_b=unreadable"; fi
+        done
+        echo "  backlight now:$_bs"
+    else
+        echo "  backlight: monitors are looked up at the first lock (or set BACKLIGHT_BUSES)"
+    fi
+    if [ -f "$BLSTATE" ]; then echo "  backlight is lowered now (saved: $(tr '\n' ';' < "$BLSTATE"))"; fi
+    return 0
+}
+#@@ end ddc
+
+# queue "dim" or "undim" for the backlight worker (nothing happens if backlight is not wanted)
+bl_send() {
+    [ -n "$LOCK_BACKLIGHT" ] || return 0
+    command -v ddc_dim >/dev/null 2>&1 || return 0
+    { echo "$1" >&4; } 2>/dev/null
+    return 0
+}
+
+bl_undim_now() {
+    command -v ddc_undim_now >/dev/null 2>&1 || return 0
+    ddc_undim_now "${1:-1}"
 }
 
 # ---------------------------------------------------------------------- early undim key
@@ -805,7 +1008,7 @@ wayland_key_hint() { echo "libinput needs read access to /dev/input: run as root
 # Key events go straight into awk, which only tracks which keys are down and prints "undim" when
 # the shortcut is complete; nothing else leaves it, and nothing is logged or stored.
 undim_key_start() {
-    [ -n "$UNDIM_KEY" ] && [ -f "$DIMFILE" ] || return 0
+    [ -n "$UNDIM_KEY" ] && { [ -f "$DIMFILE" ] || [ -f "$BLSTATE" ]; } || return 0
     command -v "${SESSION_T}_key_source" >/dev/null 2>&1 || { log "undim key: this copy has no $SESSION_T key listener"; return 0; }
     be key_check || return 0
     _kg=$(key_groups)
@@ -855,6 +1058,7 @@ on_lock() {
     [ "$STATE" = locked ] && return 0
     STATE=locked
     log "screen locked"
+    bl_send dim
     dim_screens
     save_windows
     set_input 0
@@ -866,7 +1070,7 @@ on_unlock() {
     STATE=unlocked
     log "screen unlocked"
     set_input 1
-    undim_screens
+    undim_screens_queued
     hook_send unlock
 }
 
@@ -947,6 +1151,7 @@ handle_events() {
     _pending=0
     trap '' PIPE                     # a dead hook worker must never kill this loop
     if [ "$HOOKS" = 1 ]; then exec 3> "$HOOKFIFO"; fi
+    if [ -n "${BLPID:-}" ]; then exec 4> "$BLFIFO"; fi
     while read -r _line; do
         case $_line in
             LOCKED) on_lock ;;
@@ -976,10 +1181,11 @@ single_instance() {
 shutdown() {
     trap - EXIT INT TERM HUP
     # shellcheck disable=SC2086   # a list of pids
-    kill $MONPIDS "${LOOPPID:-}" "${HOOKPID:-}" 2>/dev/null
+    kill $MONPIDS "${LOOPPID:-}" "${HOOKPID:-}" "${BLPID:-}" 2>/dev/null
+    if [ -n "${BLPID:-}" ]; then rmdir "$BLLOCK" 2>/dev/null; fi       # the worker may have died holding it
     set_input 1
-    undim_screens
-    rm -f "${FIFO:-}" "${HOOKFIFO:-}" "${PIDFILE:-}"
+    undim_screens 2
+    rm -f "${FIFO:-}" "${HOOKFIFO:-}" "${PIDFILE:-}" "${BLPID:+$BLFIFO}"
     log "stopped"
 }
 
@@ -1000,7 +1206,18 @@ watch() {
         HOOKPID=$!
     fi
     set_input 1                      # recover from an earlier crash while locked
-    undim_screens
+    undim_screens 2
+    if [ -n "$LOCK_BACKLIGHT" ]; then
+        if command -v ddc_dim >/dev/null 2>&1; then
+            rm -f "$BLBUSES" "$BLFIFO"
+            mkfifo "$BLFIFO" || die "cannot create $BLFIFO"
+            ddc_worker < "$BLFIFO" &
+            BLPID=$!
+            ddc_prime &
+        else
+            log "LOCK_BACKLIGHT is set, but this copy has no ddc part (run install.sh again to add it)"
+        fi
+    fi
     MONPIDS=
     for _m in $DETECT_METHODS; do "src_$_m"; done
     handle_events < "$FIFO" &
@@ -1019,6 +1236,8 @@ status_extra() {
     echo "  LOCK_BRIGHTNESS=${LOCK_BRIGHTNESS:-<off>}  DIM_OUTPUTS=${DIM_OUTPUTS:-<all connected>}"
     echo "  DISABLE_INPUT=$DISABLE_INPUT  LOCK_DEVICE_PATTERN=${LOCK_DEVICE_PATTERN:-<every pointer>}"
     be status
+    if command -v ddc_status >/dev/null 2>&1; then ddc_status
+    elif [ -n "$LOCK_BACKLIGHT" ]; then echo "  LOCK_BACKLIGHT=$LOCK_BACKLIGHT, but this copy has no ddc part"; fi
     if [ -n "$UNDIM_KEY" ]; then echo "  UNDIM_KEY=$UNDIM_KEY -> $(key_groups)"; else echo "  UNDIM_KEY=<off>"; fi
     if [ -f "$DIMFILE" ]; then echo "  screens are dimmed now (saved: $(tr '\n' ';' < "$DIMFILE"))"; fi
     return 0
@@ -1123,10 +1342,10 @@ setup_rundir
 load_conf
 resolve_session
 case $ACTION in
-    enable) set_input 1; undim_screens; exit 0 ;;
+    enable) set_input 1; undim_screens 3; exit 0 ;;
     undim)
         if [ -f "$DIMFILE" ]; then log "undim requested (lock-guard --undim)"; fi
-        undim_screens; exit 0 ;;
+        undim_screens 3; exit 0 ;;
     start) cmd_start; exit $? ;;
     stop) cmd_stop; exit $? ;;
     restart) cmd_stop; cmd_start; exit $? ;;

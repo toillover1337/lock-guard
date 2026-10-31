@@ -8,7 +8,7 @@
 # autostart entry can serve a machine that has both kinds of session.
 
 NAME=randr-fix
-VERSION=1.0.0
+VERSION=1.1.0
 SIBLING=lock-guard
 CONF_WARN=
 SESSION=auto
