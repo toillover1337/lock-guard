@@ -314,3 +314,7 @@ Guix + mango, Gentoo with both).
   name follow that setup (other xfdesktop versions may name the file differently: set `ICON_FILE`).
 * Windows are restored by saved geometry only; windows that moved to another workspace or were
   closed are not tracked.
+
+## License
+
+GNU General Public License v3.0, see [LICENSE](LICENSE).
