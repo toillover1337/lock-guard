@@ -1,0 +1,673 @@
+#!/bin/sh
+# randr-fix - after the monitors change (power cycle, hotplug, a slow DisplayPort link) put the
+# layout, the window positions and the desktop icons back.  Part of screen-guard.  POSIX sh.
+#
+# Needs: xev, xrandr, xset, awk.   Windows: wmctrl (and lock-guard to save them).
+# Icons (Xfce only): xfdesktop.
+# X11 only: in a Wayland session it does nothing (the compositor manages the outputs there), so one
+# autostart entry can serve a machine that has both kinds of session.
+
+NAME=randr-fix
+VERSION=1.0.0
+SIBLING=lock-guard
+CONF_WARN=
+SESSION=auto
+set -u
+
+XCONF=${XDG_CONFIG_HOME:-${HOME:-}/.config}
+
+# ---------------------------------------------------------------- defaults (see --print-config)
+PRIMARY_OUTPUT=
+PRIMARY_MODE=
+PRIMARY_RATE=
+PRIMARY_POS=0x0
+SECONDARY_OUTPUT=
+SECONDARY_MODE=
+SECONDARY_RATE=
+SECONDARY_POS=
+DEBOUNCE=5
+SECONDARY_WAIT=10
+RESTORE_WINDOWS=yes
+ICON_RESTORE=auto
+ICON_FILE=$XCONF/xfce4/desktop/icons.screen0.yaml
+ICON_GOLD=$XCONF/xfce4/desktop/icons.golden.yaml
+ICON_COOLDOWN=30
+
+# ---------------------------------------------------------------------------------- basics
+warn() { printf '%s: %s\n' "$NAME" "$*" >&2; }
+die() { warn "$*"; exit 1; }
+
+usage() {
+    cat <<EOF
+usage: $NAME [options]
+  (no options)         watch for monitor changes and reassert layout, windows and icons
+  -s, --start          start in the background (does nothing if it is already running)
+  -S, --stop           stop the running copy
+  -r, --restart        stop, then start
+  -R, --restart-all    restart randr-fix AND lock-guard (starts whichever is not running)
+      --status         show whether it runs, its settings and the latest log lines
+  -o, --once           do one reassert now and exit
+  -i, --icon-update    save the current desktop icon layout as the golden copy
+                       (the old golden copy is backed up first)
+  -y, --yes            do not ask for confirmation (with -i)
+  -c, --icon-clean     delete the golden-copy backups
+  -d, --detect         print a config for the monitors connected right now
+  -p, --print-config   print an empty, documented config
+  -C, --config FILE    use FILE instead of ~/.config/$NAME/config
+  -v, --verbose        also print log lines on stderr
+  -h, --help           this text
+  -V, --version        version
+EOF
+}
+
+print_config() {
+    cat <<EOF
+# $NAME configuration.  KEY=VALUE (spaces around key and value are ignored), comments on their own lines.
+# The file is parsed, never executed: only the keys below are read.
+# Fill the monitor section from the monitors connected now with:
+#     $NAME --detect > ~/.config/$NAME/config
+
+# Primary monitor (required).  Output names are the first column of 'xrandr --query'.
+# MODE is WIDTHxHEIGHT, RATE is in Hz, POS is XxY.  MODE and RATE may be left empty.
+PRIMARY_OUTPUT=$PRIMARY_OUTPUT
+PRIMARY_MODE=$PRIMARY_MODE
+PRIMARY_RATE=$PRIMARY_RATE
+PRIMARY_POS=$PRIMARY_POS
+
+# Secondary monitor (optional; leave SECONDARY_OUTPUT empty for a single monitor).
+SECONDARY_OUTPUT=$SECONDARY_OUTPUT
+SECONDARY_MODE=$SECONDARY_MODE
+SECONDARY_RATE=$SECONDARY_RATE
+SECONDARY_POS=$SECONDARY_POS
+
+# Seconds to wait after the last monitor change before acting.
+DEBOUNCE=$DEBOUNCE
+
+# Seconds to wait for the secondary once the primary is up (the primary must never be skipped).
+SECONDARY_WAIT=$SECONDARY_WAIT
+
+# yes = put windows back where lock-guard saved them.
+RESTORE_WINDOWS=$RESTORE_WINDOWS
+
+# Desktop icons (Xfce / xfdesktop).  auto = on when xfdesktop and a golden copy exist.
+# Save the golden copy, while the icons are where you want them, with:  $NAME --icon-update
+ICON_RESTORE=$ICON_RESTORE
+ICON_FILE=$ICON_FILE
+ICON_GOLD=$ICON_GOLD
+
+# Minimum seconds between two icon restores (stops restart loops).
+ICON_COOLDOWN=$ICON_COOLDOWN
+
+# auto = do nothing in a Wayland session (decided each start), x11 = always work, wayland = never.
+SESSION=$SESSION
+EOF
+}
+
+case $0 in
+    /*) SELF=$0 ;;
+    */*) SELF=$PWD/$0 ;;
+    *) SELF=$(command -v "$0" 2>/dev/null) || SELF=$0 ;;
+esac
+
+is_uint() { case ${1:-} in ''|*[!0-9]*) return 1 ;; esac; return 0; }
+is_int() { is_uint "${1#-}"; }
+is_hexid() {
+    case ${1:-} in 0x*) ;; *) return 1 ;; esac
+    case ${1#0x} in ''|*[!0-9a-fA-F]*) return 1 ;; esac
+    return 0
+}
+nap() { sleep 0.2 2>/dev/null || sleep 1; }
+
+# --------------------------------------------------------------------------- monitor state
+# "status primary geometry rate" for one output, e.g. "connected 1 1920x1080+0+0 144.00"
+# ("-" where unknown, "disconnected 0 - -" for an output xrandr does not list).
+out_info() {
+    xrandr --query 2>/dev/null | awk -v n="$1" '
+        $1 == n && ($2 == "connected" || $2 == "disconnected") && !found {
+            found = 1; st = $2; p = 0; g = "-"; r = ""
+            for (i = 3; i <= NF; i++) {
+                if ($i == "primary") p = 1
+                else if ($i ~ /^[0-9]+x[0-9]+\+[0-9]+\+[0-9]+$/) { g = $i; break }
+                else if ($i ~ /^\(/) break
+            }
+            next
+        }
+        found && /^[ \t]/ && r == "" {
+            for (i = 1; i <= NF; i++)
+                if ($i ~ /^[0-9.]+\*/) { r = $i; sub(/[*+].*$/, "", r); break }
+            next
+        }
+        found && /^[^ \t]/ { exit }
+        END { if (found) print st, p, g, (r == "" ? "-" : r); else print "disconnected 0 - -" }'
+}
+
+# shellcheck disable=SC2046
+out_status() { set -- $(out_info "$1"); echo "$1"; }
+
+rate_close() { awk -v a="$1" -v b="$2" 'BEGIN { d = a - b; exit !(d < 0.5 && d > -0.5) }'; }
+
+# out_matches OUTPUT MODE POS RATE WANT_PRIMARY(1|0)
+out_matches() {
+    _n=$1 _mode=$2 _pos=$3 _rate=$4 _wp=$5
+    # shellcheck disable=SC2046
+    set -- $(out_info "$_n")
+    [ "$1" = connected ] || return 1
+    [ "$2" = "$_wp" ] || return 1
+    [ "${3#*+}" = "${_pos%x*}+${_pos#*x}" ] || return 1
+    [ -z "$_mode" ] || [ "${3%%+*}" = "$_mode" ] || return 1
+    [ -z "$_rate" ] || rate_close "$_rate" "$4" || return 1
+    return 0
+}
+
+primary_up() { out_matches "$PRIMARY_OUTPUT" "$PRIMARY_MODE" "$PRIMARY_POS" "" 1; }
+
+# Print a config for what is connected now (variables are filled from xrandr).
+detect() {
+    command -v xrandr >/dev/null 2>&1 || die "xrandr not found"
+    _out=$(xrandr --query 2>/dev/null | awk '
+        /^[^ \t]/ {
+            cur = ""
+            if ($2 == "connected") {
+                g = ""; p = 0
+                for (i = 3; i <= NF; i++) {
+                    if ($i == "primary") p = 1
+                    else if ($i ~ /^[0-9]+x[0-9]+\+[0-9]+\+[0-9]+$/) { g = $i; break }
+                    else if ($i ~ /^\(/) break
+                }
+                if (g != "") { n++; name[n] = $1; geo[n] = g; prim[n] = p; cur = n }
+            }
+            next
+        }
+        cur != "" && rate[cur] == "" {
+            for (i = 1; i <= NF; i++)
+                if ($i ~ /^[0-9.]+\*/) { rate[cur] = $i; sub(/[*+].*$/, "", rate[cur]); break }
+        }
+        function show(prefix, k,   a) {
+            split(geo[k], a, /[x+]/)
+            print prefix "_OUTPUT=" name[k]
+            print prefix "_MODE=" a[1] "x" a[2]
+            print prefix "_RATE=" rate[k]
+            print prefix "_POS=" a[3] "x" a[4]
+        }
+        END {
+            if (n == 0) exit
+            pi = 1
+            for (i = 1; i <= n; i++) if (prim[i]) { pi = i; break }
+            show("PRIMARY", pi)
+            for (i = 1; i <= n; i++) if (i != pi) { show("SECONDARY", i); break }
+        }')
+    [ -n "$_out" ] || die "no connected monitor with a mode found"
+    while IFS='=' read -r _k _v; do
+        case $_k in
+            PRIMARY_OUTPUT|PRIMARY_MODE|PRIMARY_RATE|PRIMARY_POS|\
+            SECONDARY_OUTPUT|SECONDARY_MODE|SECONDARY_RATE|SECONDARY_POS) eval "$_k=\$_v" ;;
+        esac
+    done <<EOF
+$_out
+EOF
+    print_config
+}
+
+# --------------------------------------------------------------------------- arguments
+ACTION=watch
+VERBOSE=0
+ASSUME_YES=0
+CONF=$XCONF/$NAME/config
+while [ $# -gt 0 ]; do
+    case $1 in
+        -o|--once) ACTION=once ;;
+        -s|--start) ACTION=start ;;
+        -S|--stop) ACTION=stop ;;
+        -r|--restart) ACTION=restart ;;
+        -R|--restart-all) ACTION=restart-all ;;
+        --status) ACTION=status ;;
+        -i|--icon-update) ACTION=icon-update ;;
+        -y|--yes) ASSUME_YES=1 ;;
+        -c|--icon-clean) ACTION=icon-clean ;;
+        -d|--detect) ACTION=detect ;;
+        -p|--print-config) ACTION=print ;;
+        -C|--config) [ $# -ge 2 ] || die "$1 needs a file name"; CONF=$2; shift ;;
+        -v|--verbose) VERBOSE=1 ;;
+        -h|--help) usage; exit 0 ;;
+        -V|--version) echo "$NAME $VERSION"; exit 0 ;;
+        *) usage >&2; exit 2 ;;
+    esac
+    shift
+done
+
+case $ACTION in
+    print) print_config; exit 0 ;;
+    detect) detect; exit 0 ;;
+esac
+
+# ---------------------------------------------------- private runtime directory (0700, ours)
+setup_rundir() {
+    _uid=$(id -u)
+    if [ -n "${XDG_RUNTIME_DIR:-}" ] && [ -d "$XDG_RUNTIME_DIR" ]; then
+        RUNDIR=$XDG_RUNTIME_DIR/screen-guard
+    else
+        RUNDIR=${TMPDIR:-/tmp}/screen-guard-$_uid
+    fi
+    [ -L "$RUNDIR" ] && die "$RUNDIR is a symlink; refusing to use it"
+    if [ ! -d "$RUNDIR" ]; then
+        (umask 077; mkdir "$RUNDIR") 2>/dev/null || [ -d "$RUNDIR" ] || die "cannot create $RUNDIR"
+    fi
+    [ -L "$RUNDIR" ] && die "$RUNDIR is a symlink; refusing to use it"
+    _me=$(id -un 2>/dev/null || echo "$_uid")
+    # shellcheck disable=SC2046
+    set -- $(ls -ld "$RUNDIR")
+    [ "${3:-}" = "$_me" ] || [ "${3:-}" = "$_uid" ] || die "$RUNDIR is not owned by you; refusing to use it"
+    chmod 700 "$RUNDIR" 2>/dev/null
+    LOGFILE=$RUNDIR/$NAME.log
+    POSFILE=$RUNDIR/window-positions
+    GENFILE=$RUNDIR/$NAME.gen
+    LOCKDIR=$RUNDIR/$NAME.lock
+}
+
+log() {
+    printf '%s %s\n' "$(date +%H:%M:%S)" "$*" >> "$LOGFILE"
+    [ "$VERBOSE" = 1 ] && printf '%s: %s\n' "$NAME" "$*" >&2
+    if [ "$(wc -c < "$LOGFILE")" -gt 102400 ]; then mv -f "$LOGFILE" "$LOGFILE.1"; fi
+    return 0
+}
+
+# ------------------------------------------------------------------------------ config
+load_conf() {
+    [ -r "$CONF" ] || return 0
+    while IFS='=' read -r _k _v || [ -n "$_k" ]; do
+        # spaces (and a stray carriage return) around the key and the value are ignored
+        _k=${_k#"${_k%%[![:space:]]*}"}; _k=${_k%"${_k##*[![:space:]]}"}
+        _v=${_v#"${_v%%[![:space:]]*}"}; _v=${_v%"${_v##*[![:space:]]}"}
+        case $_k in ''|'#'*) continue ;; esac
+        case $_v in
+            \"*\") _v=${_v#\"}; _v=${_v%\"} ;;
+            \'*\') _v=${_v#\'}; _v=${_v%\'} ;;
+        esac
+        case $_k in
+            PRIMARY_OUTPUT|PRIMARY_MODE|PRIMARY_RATE|PRIMARY_POS|\
+            SECONDARY_OUTPUT|SECONDARY_MODE|SECONDARY_RATE|SECONDARY_POS|\
+            DEBOUNCE|SECONDARY_WAIT|RESTORE_WINDOWS|ICON_RESTORE|ICON_FILE|ICON_GOLD|ICON_COOLDOWN|SESSION)
+                eval "$_k=\$_v" ;;
+            *)
+                warn "$CONF: ignoring unknown key '$_k'"
+                CONF_WARN="${CONF_WARN:+$CONF_WARN; }unknown key '$_k' ignored"
+                ;;
+        esac
+    done < "$CONF"
+}
+
+validate_conf() {
+    [ -n "$PRIMARY_OUTPUT" ] || die "PRIMARY_OUTPUT is not set in $CONF (try: $NAME --detect > $CONF)"
+    is_uint "$DEBOUNCE" || die "$CONF: DEBOUNCE must be a whole number"
+    is_uint "$SECONDARY_WAIT" || die "$CONF: SECONDARY_WAIT must be a whole number"
+    is_uint "$ICON_COOLDOWN" || die "$CONF: ICON_COOLDOWN must be a whole number"
+    case $PRIMARY_POS in *[!0-9x-]*|''|x*|*x) die "$CONF: PRIMARY_POS must look like 0x0" ;; esac
+    if [ -n "$SECONDARY_OUTPUT" ]; then
+        case $SECONDARY_POS in *[!0-9x-]*|''|x*|*x) die "$CONF: SECONDARY_POS must look like 1920x0" ;; esac
+    fi
+    case $RESTORE_WINDOWS in yes|no) ;; *) die "$CONF: RESTORE_WINDOWS must be yes or no" ;; esac
+    case $ICON_RESTORE in auto|yes|no) ;; *) die "$CONF: ICON_RESTORE must be auto, yes or no" ;; esac
+}
+
+# ----------------------------------------------------------------------------- one run
+HAVE_LOCK=0
+release_lock() { [ "$HAVE_LOCK" = 1 ] && rm -rf "$LOCKDIR"; HAVE_LOCK=0; }
+
+acquire_lock() {
+    _tries=0
+    while ! mkdir "$LOCKDIR" 2>/dev/null; do
+        _holder=$(cat "$LOCKDIR/pid" 2>/dev/null)
+        if [ -n "$_holder" ] && ! kill -0 "$_holder" 2>/dev/null; then rm -rf "$LOCKDIR"; fi
+        _tries=$((_tries + 1))
+        [ "$_tries" -gt 60 ] && return 1
+        sleep 1
+    done
+    echo $$ > "$LOCKDIR/pid"
+    HAVE_LOCK=1
+    trap release_lock EXIT
+    trap 'release_lock; exit 1' INT TERM HUP
+    return 0
+}
+
+layout_ok() {
+    out_matches "$PRIMARY_OUTPUT" "$PRIMARY_MODE" "$PRIMARY_POS" "$PRIMARY_RATE" 1 || return 1
+    if [ -n "$SECONDARY_OUTPUT" ] && [ "$(out_status "$SECONDARY_OUTPUT")" = connected ]; then
+        out_matches "$SECONDARY_OUTPUT" "$SECONDARY_MODE" "$SECONDARY_POS" "$SECONDARY_RATE" 0 || return 1
+    fi
+    return 0
+}
+
+apply_layout() {
+    _now=$(date +%s)
+    _last=$(cat "$RUNDIR/$NAME.xrandr" 2>/dev/null)
+    is_uint "$_last" || _last=0
+    if [ $((_now - _last)) -lt 10 ]; then
+        log "xrandr ran moments ago - not repeating it"
+        return 0
+    fi
+    echo "$_now" > "$RUNDIR/$NAME.xrandr"
+    set -- xrandr --output "$PRIMARY_OUTPUT" --primary
+    [ -n "$PRIMARY_MODE" ] && set -- "$@" --mode "$PRIMARY_MODE"
+    [ -n "$PRIMARY_RATE" ] && set -- "$@" --rate "$PRIMARY_RATE"
+    set -- "$@" --pos "$PRIMARY_POS"
+    if [ -n "$SECONDARY_OUTPUT" ] && [ "$(out_status "$SECONDARY_OUTPUT")" = connected ]; then
+        set -- "$@" --output "$SECONDARY_OUTPUT"
+        [ -n "$SECONDARY_MODE" ] && set -- "$@" --mode "$SECONDARY_MODE"
+        [ -n "$SECONDARY_RATE" ] && set -- "$@" --rate "$SECONDARY_RATE"
+        set -- "$@" --pos "$SECONDARY_POS"
+    fi
+    "$@"
+    log "ran: $* (exit $?)"
+    sleep 2
+}
+
+restore_windows() {
+    [ "$RESTORE_WINDOWS" = yes ] || return 0
+    [ -r "$POSFILE" ] || return 0
+    command -v wmctrl >/dev/null 2>&1 || { log "wmctrl not found - windows not restored"; return 0; }
+    while read -r _id _x _y _w _h _max; do
+        # shellcheck disable=SC2015
+        is_hexid "$_id" && is_int "$_x" && is_int "$_y" && is_uint "$_w" && is_uint "$_h" || continue
+        wmctrl -i -r "$_id" -b remove,maximized_vert,maximized_horz 2>/dev/null
+        nap
+        wmctrl -i -r "$_id" -e "0,$_x,$_y,$_w,$_h" 2>/dev/null
+        nap
+        [ "${_max:-0}" = 1 ] && wmctrl -i -r "$_id" -b add,maximized_vert,maximized_horz 2>/dev/null
+        log "window $_id -> $_x,$_y max=${_max:-0}"
+    done < "$POSFILE"
+}
+
+icons_enabled() {
+    case $ICON_RESTORE in
+        yes) return 0 ;;
+        no) return 1 ;;
+    esac
+    command -v xfdesktop >/dev/null 2>&1 && [ -f "$ICON_GOLD" ]
+}
+
+restore_icons() {
+    [ -f "$ICON_GOLD" ] || { log "no golden icon file ($ICON_GOLD) - icons not restored"; return 0; }
+    _now=$(date +%s)
+    _last=$(cat "$RUNDIR/$NAME.icons" 2>/dev/null)
+    is_uint "$_last" || _last=0
+    if [ $((_now - _last)) -lt "$ICON_COOLDOWN" ]; then
+        log "icons restored moments ago - not repeating"
+        return 0
+    fi
+    echo "$_now" > "$RUNDIR/$NAME.icons"
+    xfdesktop --quit >/dev/null 2>&1
+    _i=0
+    while pgrep -u "$(id -u)" -x xfdesktop >/dev/null 2>&1; do
+        _i=$((_i + 1))
+        if [ "$_i" -gt 50 ]; then log "xfdesktop did not quit - icons NOT restored"; return 1; fi
+        nap
+    done
+    cp -p "$ICON_GOLD" "$ICON_FILE" || { log "could not copy $ICON_GOLD"; return 1; }
+    nohup xfdesktop >/dev/null 2>&1 &
+    log "icons restored from $ICON_GOLD"
+}
+
+do_fix() {
+    _s=$(xset q 2>/dev/null | sed -n 's/^ *Monitor is //p')
+    case $_s in ''|On) ;; *) log "monitors are $_s - skipping"; return 0 ;; esac
+
+    if [ "$(out_status "$PRIMARY_OUTPUT")" != connected ]; then
+        log "$PRIMARY_OUTPUT is not connected yet - skipping (the next RandR event retries)"
+        return 0
+    fi
+    if [ -n "$SECONDARY_OUTPUT" ] && [ "$(out_status "$SECONDARY_OUTPUT")" != connected ]; then
+        log "$SECONDARY_OUTPUT is not connected yet - waiting up to ${SECONDARY_WAIT}s"
+        _i=0
+        while [ "$_i" -lt "$SECONDARY_WAIT" ]; do
+            sleep 1
+            _i=$((_i + 1))
+            [ "$(out_status "$SECONDARY_OUTPUT")" = connected ] && break
+        done
+        if [ "$(out_status "$PRIMARY_OUTPUT")" != connected ]; then
+            log "$PRIMARY_OUTPUT disappeared while waiting - skipping"
+            return 0
+        fi
+    fi
+
+    if layout_ok; then
+        log "layout already correct - not running xrandr"
+    else
+        apply_layout
+    fi
+    restore_windows
+    if ! icons_enabled; then
+        return 0
+    fi
+    if primary_up; then
+        restore_icons
+    else
+        log "$PRIMARY_OUTPUT is not primary at $PRIMARY_POS - icons NOT restored"
+    fi
+}
+
+run_once() {
+    acquire_lock || die "could not get the run lock ($LOCKDIR)"
+    do_fix
+}
+
+# ------------------------------------------------------------------ golden icon copy (-i, -c)
+icon_update() {
+    primary_up || die "$PRIMARY_OUTPUT is not up as primary at $PRIMARY_POS; not saving icons"
+    [ -f "$ICON_FILE" ] || die "$ICON_FILE not found"
+    if [ -f "$ICON_GOLD" ]; then
+        if cmp -s "$ICON_GOLD" "$ICON_FILE"; then
+            echo "Icons already match the golden copy; nothing to do."
+            return 0
+        fi
+        _n=$(diff -u "$ICON_GOLD" "$ICON_FILE" | grep '^+' | grep -vc '^+++')
+        echo "The current layout differs from the golden copy ($_n changed line(s))."
+        if [ "$ASSUME_YES" != 1 ]; then
+            [ -t 0 ] || die "not a terminal: re-run with -y to confirm"
+            printf 'Replace the golden copy with the current layout? [y/N] '
+            read -r _ans
+            case $_ans in y|Y|yes|YES) ;; *) echo "Cancelled."; return 0 ;; esac
+        fi
+        _bak=$ICON_GOLD.bak-$(date +%Y%m%d-%H%M%S)
+        cp -p "$ICON_GOLD" "$_bak" || die "could not back up $ICON_GOLD"
+        echo "Old golden copy backed up to $_bak"
+    fi
+    cp -p "$ICON_FILE" "$ICON_GOLD" || die "could not write $ICON_GOLD"
+    echo "Golden icon layout saved to $ICON_GOLD"
+}
+
+icon_clean() {
+    _n=0
+    for _f in "$ICON_GOLD".bak-*; do
+        [ -e "$_f" ] || continue
+        rm -f -- "$_f" && _n=$((_n + 1))
+    done
+    echo "Removed $_n backup(s)."
+}
+
+# --------------------------------------------------------------------------------- watcher
+single_instance() {
+    PIDFILE=$RUNDIR/$NAME.pid
+    if [ -r "$PIDFILE" ]; then
+        _old=$(cat "$PIDFILE" 2>/dev/null)
+        if [ -n "$_old" ] && kill -0 "$_old" 2>/dev/null; then
+            _cmd=$(ps -p "$_old" -o args= 2>/dev/null) || _cmd=$NAME
+            case $_cmd in *"$NAME"*) die "already running (pid $_old)" ;; esac
+        fi
+    fi
+    echo $$ > "$PIDFILE"
+}
+
+# Every RandR event bumps a counter and starts a timer; only the timer that still sees its own
+# number after DEBOUNCE seconds (= no newer event) runs the fix.
+event_loop() {
+    _gen=0
+    while read -r _line; do
+        case $_line in
+            RRScreenChangeNotify*)
+                _gen=$((_gen + 1))
+                echo "$_gen" > "$GENFILE"
+                (
+                    sleep "$DEBOUNCE"
+                    [ "$(cat "$GENFILE" 2>/dev/null)" = "$_gen" ] || exit 0
+                    if [ "$VERBOSE" = 1 ]; then set -- -v; else set --; fi
+                    if [ -x "$SELF" ]; then exec "$SELF" -C "$CONF" --once "$@"; fi
+                    exec /bin/sh "$SELF" -C "$CONF" --once "$@"
+                ) >/dev/null 2>&1 &
+                ;;
+        esac
+    done
+    log "event source ended"
+}
+
+shutdown() {
+    trap - EXIT INT TERM HUP
+    kill "${XEVPID:-}" "${LOOPPID:-}" 2>/dev/null
+    rm -f "${FIFO:-}" "${GENFILE:-}" "${PIDFILE:-}"
+    log "stopped"
+}
+
+watch() {
+    command -v xev >/dev/null 2>&1 || die "xev not found (package x11-apps / xorg-xev)"
+    command -v xrandr >/dev/null 2>&1 || die "xrandr not found"
+    single_instance
+    FIFO=$RUNDIR/$NAME.fifo
+    rm -f "$FIFO"
+    mkfifo "$FIFO" || die "cannot create $FIFO"
+    xev -root -event randr > "$FIFO" 2>> "$LOGFILE" &
+    XEVPID=$!
+    event_loop < "$FIFO" &
+    LOOPPID=$!
+    trap 'shutdown; exit 0' INT TERM HUP
+    trap shutdown EXIT
+    log "watching RandR events (pid $$, debounce ${DEBOUNCE}s)"
+    if [ -n "$CONF_WARN" ]; then log "config warnings: $CONF_WARN"; fi
+    wait "$LOOPPID"
+}
+
+status_extra() {
+    echo "settings: $CONF"
+    echo "  primary $PRIMARY_OUTPUT ${PRIMARY_MODE:-?} @ ${PRIMARY_RATE:-?} Hz at $PRIMARY_POS; secondary ${SECONDARY_OUTPUT:-none}${SECONDARY_OUTPUT:+ at $SECONDARY_POS}"
+    if layout_ok; then echo "  layout: as configured"; else echo "  layout: NOT as configured right now"; fi
+    if icons_enabled; then echo "  icons: restored after a reassert (golden copy $ICON_GOLD)"; else echo "  icons: not restored (off, no xfdesktop, or no golden copy)"; fi
+    return 0
+}
+
+after_kill9() {          # the watcher could not clean up after itself
+    rm -f "$RUNDIR/$NAME.pid" "$RUNDIR/$NAME.fifo" "$RUNDIR/$NAME.gen"
+}
+
+# ------------------------------------------------------------------ start / stop / status
+# pid of the running watcher (prints it, succeeds), or fail.  The pid file must name a live
+# process whose command line mentions this script, so a recycled pid is not mistaken for us.
+running_pid() {
+    _pf=$RUNDIR/$NAME.pid
+    [ -r "$_pf" ] || return 1
+    _rp=$(cat "$_pf" 2>/dev/null)
+    case $_rp in ''|*[!0-9]*) return 1 ;; esac
+    kill -0 "$_rp" 2>/dev/null || return 1
+    _cmd=$(ps -p "$_rp" -o args= 2>/dev/null) || _cmd=$NAME
+    case $_cmd in *"$NAME"*) echo "$_rp"; return 0 ;; esac
+    return 1
+}
+
+# Wayland sessions have nothing for this program to do.
+on_wayland() {
+    case $SESSION in x11) return 1 ;; wayland) return 0 ;; esac
+    case ${XDG_SESSION_TYPE:-} in wayland) return 0 ;; x11) return 1 ;; esac
+    [ -n "${WAYLAND_DISPLAY:-}" ]
+}
+
+cmd_start() {
+    if on_wayland; then echo "$NAME: Wayland session - nothing to do (the compositor manages the monitors)"; return 0; fi
+    if _p=$(running_pid); then
+        echo "$NAME is already running (pid $_p)"
+        return 0
+    fi
+    if [ -x "$SELF" ]; then set -- "$SELF"; else set -- /bin/sh "$SELF"; fi
+    nohup "$@" -C "$CONF" </dev/null >/dev/null 2>> "$LOGFILE" &
+    _i=0
+    while [ "$_i" -lt 15 ]; do
+        nap
+        if _p=$(running_pid); then
+            echo "$NAME started (pid $_p)"
+            return 0
+        fi
+        _i=$((_i + 1))
+    done
+    echo "$NAME did not start; the end of $LOGFILE says:" >&2
+    tail -n 5 "$LOGFILE" >&2
+    return 1
+}
+
+cmd_stop() {
+    if ! _p=$(running_pid); then
+        echo "$NAME is not running"
+        return 0
+    fi
+    kill "$_p" 2>/dev/null
+    _i=0
+    while kill -0 "$_p" 2>/dev/null; do
+        _i=$((_i + 1))
+        if [ "$_i" -gt 25 ]; then
+            kill -9 "$_p" 2>/dev/null
+            echo "$NAME did not stop in 5 s and was killed" >&2
+            after_kill9
+            break
+        fi
+        nap
+    done
+    echo "$NAME stopped"
+    return 0
+}
+
+# Restart this program and its sibling (they are independent, but after an upgrade both need it).
+cmd_restart_all() {
+    _rc=0
+    cmd_stop
+    cmd_start || _rc=1
+    case $SELF in */*) _dir=${SELF%/*} ;; *) _dir=. ;; esac
+    _sib=$_dir/$SIBLING
+    if [ -x "$_sib" ]; then
+        set -- "$_sib"
+    elif [ -f "$_sib" ]; then
+        set -- /bin/sh "$_sib"
+    else
+        echo "$SIBLING not found next to $SELF - not restarted" >&2
+        return 1
+    fi
+    "$@" --restart || _rc=1
+    return "$_rc"
+}
+
+cmd_status() {
+    _p=
+    if _p=$(running_pid); then echo "$NAME is running (pid $_p)"; _rc=0; else echo "$NAME is not running"; _rc=3; fi
+    status_extra
+    if [ -n "$CONF_WARN" ]; then echo "config warnings: $CONF_WARN"; fi
+    if [ -s "$LOGFILE" ]; then
+        echo "recent log ($LOGFILE):"
+        tail -n 6 "$LOGFILE" | sed 's/^/  /'
+    fi
+    return "$_rc"
+}
+
+# --------------------------------------------------------------------------------- main
+setup_rundir
+load_conf
+case $SESSION in auto|x11|wayland) ;; *) die "$CONF: SESSION must be auto, x11 or wayland" ;; esac
+case $ACTION in
+    watch|once|icon-update|detect)
+        if on_wayland; then echo "$NAME: Wayland session - nothing to do (the compositor manages the monitors)"; exit 0; fi ;;
+esac
+case $ACTION in icon-clean|stop) ;; *) validate_conf ;; esac
+case $ACTION in
+    start) cmd_start; exit $? ;;
+    stop) cmd_stop; exit $? ;;
+    restart) cmd_stop; cmd_start; exit $? ;;
+    restart-all) cmd_restart_all; exit $? ;;
+    status) cmd_status; exit $? ;;
+    once) run_once ;;
+    icon-update) icon_update ;;
+    icon-clean) icon_clean ;;
+    watch) watch ;;
+esac

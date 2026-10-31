@@ -1,0 +1,7 @@
+0x01000003  0 100  80   800  600  host Terminal
+0x02000004  0 2000 100  900  700  host Browser
+0x02000005  0 1930 50   600  400  host Minimised thing
+0x02000006 -1 2000 0    1920 30   host Panel
+0x02000007  0 1920 0    1920 1080 host Maximised video
+0x02000008  0 1700 100  800  600  host Straddles secondary
+0x02000009  0 1000 100  800  600  host Straddles primary

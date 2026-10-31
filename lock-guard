@@ -1,0 +1,1136 @@
+#!/bin/sh
+# lock-guard - while the screen is locked, switch off chosen input devices so a twitching
+# mouse cannot wake the monitors, and remember where the windows on the secondary monitor(s)
+# are so randr-fix can put them back.  Part of screen-guard.  POSIX sh.
+#
+# One file, several environments: code for X11 / Wayland and for the ways of noticing a lock lives
+# in blocks between "#@@ begin NAME" and "#@@ end NAME" lines.  Which one runs is decided when it
+# starts (SESSION, LOCK_DETECT); install.sh can remove blocks you do not need.
+#   x11      needs: xinput, xrandr, xset, wmctrl, xprop, awk   (xmodmap optional)
+#   wayland  needs: awk; optional: wl-gammarelay-rs + busctl (dimming), libinput (UNDIM_KEY)
+#   dbus     needs: dbus-monitor      process  needs: pgrep
+# Optional everywhere: stdbuf (GNU coreutils), timeout.
+
+NAME=lock-guard
+VERSION=1.0.0
+SIBLING=randr-fix
+CONF_WARN=
+set -u
+
+# ---------------------------------------------------------------- defaults (see --print-config)
+LOCK_DEVICE_PATTERN=
+DISABLE_INPUT=yes
+SAVE_WINDOWS=secondary
+SCREENSAVER_INTERFACES="org.xfce.ScreenSaver org.freedesktop.ScreenSaver"
+LOCK_COMMAND=
+UNLOCK_COMMAND=
+HOOK_TIMEOUT=20
+LOCK_BRIGHTNESS=
+DIM_OUTPUTS=
+UNDIM_KEY=
+SESSION=auto
+LOCK_DETECT=auto
+LOCKER_PROCESSES="swaylock gtklock hyprlock waylock i3lock slock xsecurelock"
+INPUT_OFF_COMMAND=
+INPUT_ON_COMMAND=
+DIM_COMMAND=
+UNDIM_COMMAND=
+HOOKS=0
+SESSION_T=x11
+DETECT_METHODS=dbus
+MONPIDS=
+
+# ---------------------------------------------------------------------------------- basics
+warn() { printf '%s: %s\n' "$NAME" "$*" >&2; }
+die() { warn "$*"; exit 1; }
+
+usage() {
+    cat <<EOF
+usage: $NAME [options]
+  (no options)        watch for the screen locking / unlocking (run this from autostart)
+  -s, --start         start in the background (does nothing if it is already running)
+  -S, --stop          stop the running copy
+  -r, --restart       stop, then start
+  -R, --restart-all   restart lock-guard AND randr-fix (starts whichever is not running)
+      --status        show whether it runs, its settings and the latest log lines
+  --enable            switch input devices back on and restore brightness now (rescue), then exit
+  --undim             restore the brightness now, while locked (bind this to a key in your
+                      compositor / window manager if you like), then exit
+  -p, --print-config  print a documented default config and exit
+  -C, --config FILE   use FILE instead of ~/.config/$NAME/config
+  -v, --verbose       also print log lines on stderr
+  -h, --help          this text
+  -V, --version       version
+EOF
+}
+
+print_config() {
+    cat <<EOF
+# $NAME configuration.  KEY=VALUE (spaces around key and value are ignored), comments on their own lines.
+# The file is parsed, never executed: only the keys below are read.
+
+# Input devices to switch off while the screen is locked.  A case-insensitive extended
+# regular expression matched against the lines of 'xinput list'.  Empty = every slave
+# pointer device (mice, touchpads) except XTEST.  Keyboards are never touched unless
+# your pattern matches them, so you can still type your password.
+# Example: LOCK_DEVICE_PATTERN=acme|logitech
+LOCK_DEVICE_PATTERN=$LOCK_DEVICE_PATTERN
+
+# yes = switch the devices off on lock and back on at unlock; no = do not touch input.
+DISABLE_INPUT=$DISABLE_INPUT
+
+# Which windows to remember on lock (randr-fix puts them back): secondary = windows whose
+# centre is on a non-primary monitor, all = every window, no = none.
+SAVE_WINDOWS=$SAVE_WINDOWS
+
+# D-Bus interfaces to listen on, space separated.  Xfce's screensaver uses
+# org.xfce.ScreenSaver; many others use org.freedesktop.ScreenSaver.
+SCREENSAVER_INTERFACES=$SCREENSAVER_INTERFACES
+
+# Commands to run on lock / unlock (empty = none), for example to switch RGB lighting:
+#   LOCK_COMMAND=openrgb --profile Night
+#   UNLOCK_COMMAND=openrgb --profile Day
+# They run through 'sh -c' in the background, one at a time and in order, so a slow command
+# never delays switching your input devices back on.  Their output goes to the log.
+# NOTE: unlike every other key these are executed.  Keep this file writable only by you.
+LOCK_COMMAND=$LOCK_COMMAND
+UNLOCK_COMMAND=$UNLOCK_COMMAND
+
+# Seconds a hook may run before it is stopped (needs the 'timeout' tool, ignored without it).
+HOOK_TIMEOUT=$HOOK_TIMEOUT
+
+# Dim the monitors while the screen is locked, so a stray key press that wakes them (a cat on
+# the keyboard) shows a faint lock screen instead of a bright flash.  A number from 0.05 (very
+# dim) to 1.0; empty = never touch brightness.  This is X11 software dimming (xrandr
+# --brightness): it scales what is drawn and does not lower the monitor's backlight.  The old
+# brightness is restored at unlock, when lock-guard stops or starts, and by 'lock-guard --enable'.
+LOCK_BRIGHTNESS=$LOCK_BRIGHTNESS
+
+# Outputs to dim: names from 'xrandr --query', space separated.  Empty = every connected output.
+DIM_OUTPUTS=$DIM_OUTPUTS
+
+# Keyboard shortcut that restores the brightness early while the screen is still locked (for when
+# you want to see the lock screen better).  Empty = no shortcut.  Keys joined with "+": the
+# modifiers Ctrl, Alt, Shift, Super (either side), then a key name from 'xmodmap -pke' or the built-in list (b, F9,
+# ...) or a number (a keycode, see 'xinput test-xi2 --root').  Hold the modifiers, then press the
+# last key.  Example:  UNDIM_KEY=Ctrl+Shift+b   (avoid Ctrl+Alt+F1..F12: the system switches
+# terminals on those).  Needs LOCK_BRIGHTNESS.
+# PRIVACY: while the screen is dimmed and locked, lock-guard listens to raw keyboard events (the
+# only way to see keys while the lock screen owns the keyboard).  It only looks for this shortcut;
+# no other key is stored, logged or passed on.  Leave it empty if you do not want that.
+UNDIM_KEY=$UNDIM_KEY
+
+# ---- environment -------------------------------------------------------------------------------
+# Which kind of session this is: auto (decided each time lock-guard starts: Wayland if the
+# session says so, else X11), x11 or wayland.  One install can serve both an X11 desktop and a
+# Wayland compositor on the same machine.
+SESSION=$SESSION
+
+# How a lock is noticed, space separated: dbus (the screensaver tells us over D-Bus: Xfce,
+# GNOME, KDE ...), process (watch for a screen locker program such as swaylock).  auto = dbus on
+# X11 and process on Wayland.  Use "dbus process" to listen to both.
+LOCK_DETECT=$LOCK_DETECT
+
+# process detection: names of screen locker programs (exact process names, space separated).
+LOCKER_PROCESSES=$LOCKER_PROCESSES
+
+# Wayland has no generic way to switch input devices off, so you say how for your compositor:
+# commands run (sh -c) on lock / unlock when DISABLE_INPUT=yes.  Empty = input stays on.
+# On X11 LOCK_DEVICE_PATTERN is used instead and these are ignored.
+INPUT_OFF_COMMAND=$INPUT_OFF_COMMAND
+INPUT_ON_COMMAND=$INPUT_ON_COMMAND
+
+# Wayland dimming uses wl-gammarelay-rs (it must be running; needs busctl).  To use another tool
+# give both commands (sh -c): DIM_COMMAND gets the wanted level in the environment variable LEVEL
+# and UNDIM_COMMAND must put the brightness back.  Ignored on X11.
+DIM_COMMAND=$DIM_COMMAND
+UNDIM_COMMAND=$UNDIM_COMMAND
+EOF
+}
+
+case $0 in
+    /*) SELF=$0 ;;
+    */*) SELF=$PWD/$0 ;;
+    *) SELF=$(command -v "$0" 2>/dev/null) || SELF=$0 ;;
+esac
+
+# --------------------------------------------------------------------------- arguments
+ACTION=watch
+VERBOSE=0
+CONF=${XDG_CONFIG_HOME:-${HOME:-}/.config}/$NAME/config
+while [ $# -gt 0 ]; do
+    case $1 in
+        --enable) ACTION=enable ;;
+        --undim) ACTION=undim ;;
+        -s|--start) ACTION=start ;;
+        -S|--stop) ACTION=stop ;;
+        -r|--restart) ACTION=restart ;;
+        -R|--restart-all) ACTION=restart-all ;;
+        --status) ACTION=status ;;
+        -p|--print-config) ACTION=print ;;
+        -C|--config) [ $# -ge 2 ] || die "$1 needs a file name"; CONF=$2; shift ;;
+        -v|--verbose) VERBOSE=1 ;;
+        -h|--help) usage; exit 0 ;;
+        -V|--version) echo "$NAME $VERSION"; exit 0 ;;
+        *) usage >&2; exit 2 ;;
+    esac
+    shift
+done
+
+[ "$ACTION" = print ] && { print_config; exit 0; }
+
+# ---------------------------------------------------- private runtime directory (0700, ours)
+setup_rundir() {
+    _uid=$(id -u)
+    if [ -n "${XDG_RUNTIME_DIR:-}" ] && [ -d "$XDG_RUNTIME_DIR" ]; then
+        RUNDIR=$XDG_RUNTIME_DIR/screen-guard
+    else
+        RUNDIR=${TMPDIR:-/tmp}/screen-guard-$_uid
+    fi
+    [ -L "$RUNDIR" ] && die "$RUNDIR is a symlink; refusing to use it"
+    if [ ! -d "$RUNDIR" ]; then
+        (umask 077; mkdir "$RUNDIR") 2>/dev/null || [ -d "$RUNDIR" ] || die "cannot create $RUNDIR"
+    fi
+    [ -L "$RUNDIR" ] && die "$RUNDIR is a symlink; refusing to use it"
+    _me=$(id -un 2>/dev/null || echo "$_uid")
+    # shellcheck disable=SC2046
+    set -- $(ls -ld "$RUNDIR")
+    [ "${3:-}" = "$_me" ] || [ "${3:-}" = "$_uid" ] || die "$RUNDIR is not owned by you; refusing to use it"
+    chmod 700 "$RUNDIR" 2>/dev/null
+    LOGFILE=$RUNDIR/$NAME.log
+    POSFILE=$RUNDIR/window-positions
+    DIMFILE=$RUNDIR/dim-state
+    DIMLOCK=$RUNDIR/dim.lock
+    KEEPFILE=$RUNDIR/dim-keeper
+    KEYFIFO=$RUNDIR/undim-key.fifo
+    KEYPIDS=$RUNDIR/undim-key.pids
+}
+
+log() {
+    printf '%s %s\n' "$(date +%H:%M:%S)" "$*" >> "$LOGFILE"
+    [ "$VERBOSE" = 1 ] && printf '%s: %s\n' "$NAME" "$*" >&2
+    if [ "$(wc -c < "$LOGFILE")" -gt 102400 ]; then mv -f "$LOGFILE" "$LOGFILE.1"; fi
+    return 0
+}
+
+# ------------------------------------------------------------------------------ config
+load_conf() {
+    [ -r "$CONF" ] || return 0
+    while IFS='=' read -r _k _v || [ -n "$_k" ]; do
+        # spaces (and a stray carriage return) around the key and the value are ignored
+        _k=${_k#"${_k%%[![:space:]]*}"}; _k=${_k%"${_k##*[![:space:]]}"}
+        _v=${_v#"${_v%%[![:space:]]*}"}; _v=${_v%"${_v##*[![:space:]]}"}
+        case $_k in ''|'#'*) continue ;; esac
+        case $_v in
+            \"*\") _v=${_v#\"}; _v=${_v%\"} ;;
+            \'*\') _v=${_v#\'}; _v=${_v%\'} ;;
+        esac
+        case $_k in
+            LOCK_DEVICE_PATTERN|DISABLE_INPUT|SAVE_WINDOWS|SCREENSAVER_INTERFACES|\
+            LOCK_COMMAND|UNLOCK_COMMAND|HOOK_TIMEOUT|LOCK_BRIGHTNESS|DIM_OUTPUTS|UNDIM_KEY|\
+            SESSION|LOCK_DETECT|LOCKER_PROCESSES|INPUT_OFF_COMMAND|INPUT_ON_COMMAND|DIM_COMMAND|UNDIM_COMMAND) eval "$_k=\$_v" ;;
+            *)
+                warn "$CONF: ignoring unknown key '$_k'"
+                CONF_WARN="${CONF_WARN:+$CONF_WARN; }unknown key '$_k' ignored"
+                ;;
+        esac
+    done < "$CONF"
+    case $DISABLE_INPUT in yes|no) ;; *) die "$CONF: DISABLE_INPUT must be yes or no" ;; esac
+    case $SAVE_WINDOWS in secondary|all|no) ;; *) die "$CONF: SAVE_WINDOWS must be secondary, all or no" ;; esac
+    case $HOOK_TIMEOUT in ''|*[!0-9]*) die "$CONF: HOOK_TIMEOUT must be a whole number of seconds" ;; esac
+    case $SESSION in auto|x11|wayland) ;; *) die "$CONF: SESSION must be auto, x11 or wayland" ;; esac
+    case $LOCK_DETECT in ''|*[!a-z\ ]*) die "$CONF: LOCK_DETECT must be auto or a list of: dbus process" ;; esac
+    case $LOCKER_PROCESSES in *[!A-Za-z0-9_.\ -]*) die "$CONF: LOCKER_PROCESSES may only hold program names separated by spaces" ;; esac
+    if [ -n "$LOCK_COMMAND$UNLOCK_COMMAND" ]; then HOOKS=1; fi
+    if [ -n "$LOCK_BRIGHTNESS" ]; then
+        case $LOCK_BRIGHTNESS in *[!0-9.]*|*.*.*) die "$CONF: LOCK_BRIGHTNESS must be a number from 0.05 to 1.0" ;; esac
+        awk -v b="$LOCK_BRIGHTNESS" 'BEGIN { exit !(b >= 0.05 && b <= 1) }' ||
+            die "$CONF: LOCK_BRIGHTNESS must be a number from 0.05 to 1.0"
+    fi
+    if [ -n "$UNDIM_KEY" ]; then
+        case $UNDIM_KEY in
+            *[!A-Za-z0-9_+]*|+*|*+|*++*) die "$CONF: UNDIM_KEY must look like Ctrl+Shift+b (key names or numbers joined with +)" ;;
+        esac
+        [ -n "$LOCK_BRIGHTNESS" ] || warn "$CONF: UNDIM_KEY does nothing without LOCK_BRIGHTNESS"
+    fi
+}
+
+
+# ------------------------------------------------------------------------------- backends
+# Shared code reaches environment-specific code only through be(), which calls
+# x11_FUNCTION or wayland_FUNCTION for the session in use.  If that block was removed from this
+# copy, the call is logged and does nothing, so a trimmed copy still runs.
+be() {
+    _bf=$1; shift
+    if command -v "${SESSION_T}_$_bf" >/dev/null 2>&1; then
+        "${SESSION_T}_$_bf" "$@"
+    else
+        case " ${BE_WARNED:-} " in
+            *" $_bf "*) ;;
+            *) BE_WARNED="${BE_WARNED:-} $_bf"; log "this copy has no $SESSION_T support for '$_bf'" ;;
+        esac
+        return 0
+    fi
+}
+
+# What is in this copy (block names present).
+backends_present() {
+    _bp=
+    command -v x11_set_input >/dev/null 2>&1 && _bp="$_bp x11"
+    command -v wayland_set_input >/dev/null 2>&1 && _bp="$_bp wayland"
+    command -v src_dbus >/dev/null 2>&1 && _bp="$_bp dbus"
+    command -v src_process >/dev/null 2>&1 && _bp="$_bp process"
+    echo "${_bp# }"
+}
+
+resolve_session() {
+    case $SESSION in
+        x11|wayland) SESSION_T=$SESSION ;;
+        *)
+            case ${XDG_SESSION_TYPE:-} in
+                wayland) SESSION_T=wayland ;;
+                x11) SESSION_T=x11 ;;
+                *) if [ -n "${WAYLAND_DISPLAY:-}" ]; then SESSION_T=wayland; else SESSION_T=x11; fi ;;
+            esac
+            ;;
+    esac
+    if [ "$LOCK_DETECT" = auto ]; then
+        case $SESSION_T in wayland) DETECT_METHODS=process ;; *) DETECT_METHODS=dbus ;; esac
+    else
+        DETECT_METHODS=$LOCK_DETECT
+    fi
+}
+
+# run_cmd SECONDS COMMAND: sh -c COMMAND, stopped after SECONDS when a timeout tool exists
+run_cmd() {
+    if command -v timeout >/dev/null 2>&1; then timeout "$1" sh -c "$2"; else sh -c "$2"; fi
+}
+
+# --------------------------------------------------------------------------- input devices
+#@@ begin x11
+device_ids() {
+    xinput list 2>/dev/null | awk -v pat="$LOCK_DEVICE_PATTERN" '
+        $0 ~ /Virtual core/ { next }
+        pat == "" { if ($0 !~ /slave +pointer/ || $0 ~ /XTEST/) next }
+        pat != "" { if (tolower($0) !~ tolower(pat)) next }
+        { for (i = 1; i <= NF; i++)
+              if ($i ~ /^id=[0-9]+$/) { sub(/^id=/, "", $i); print $i; break } }'
+}
+
+x11_set_input() {   # 1 = switch on, 0 = switch off
+    command -v xinput >/dev/null 2>&1 || { warn "xinput not found"; return 0; }
+    if [ "$1" = 1 ]; then _act=enable; else _act=disable; fi
+    for _id in $(device_ids); do
+        if xinput "$_act" "$_id" >/dev/null 2>&1; then log "xinput $_act $_id"; fi
+    done
+}
+#@@ end x11
+
+#@@ begin wayland
+# Wayland has no generic way to disable a device; the user says how (INPUT_OFF_COMMAND /
+# INPUT_ON_COMMAND), for example a call to their compositor's own tool.
+wayland_set_input() {
+    if [ "$1" = 1 ]; then _ic=$INPUT_ON_COMMAND; else _ic=$INPUT_OFF_COMMAND; fi
+    if [ -z "$_ic" ]; then
+        [ "$1" = 0 ] && log "input: INPUT_OFF_COMMAND is empty - input stays on while locked"
+        return 0
+    fi
+    run_cmd "$HOOK_TIMEOUT" "$_ic" >> "$LOGFILE" 2>&1
+    log "input command finished (exit $?)"
+    return 0
+}
+#@@ end wayland
+
+set_input() {   # 1 = switch on, 0 = switch off
+    [ "$DISABLE_INPUT" = yes ] || return 0
+    be set_input "$1"
+}
+
+# ------------------------------------------------------------------------------ windows
+#@@ begin x11
+# One "x0,y0,x1,y1" rectangle per connected non-primary monitor, joined by ";".
+secondary_rects() {
+    xrandr --query 2>/dev/null | awk '
+        /^[^ \t]/ && $2 == "connected" {
+            g = ""; p = 0
+            for (i = 3; i <= NF; i++) {
+                if ($i == "primary") p = 1
+                else if ($i ~ /^[0-9]+x[0-9]+\+[0-9]+\+[0-9]+$/) { g = $i; break }
+                else if ($i ~ /^\(/) break
+            }
+            if (g != "") { n++; geo[n] = g; prim[n] = p; if (p) hasp = 1 }
+        }
+        END {
+            for (i = 1; i <= n; i++) {
+                if (hasp) { if (prim[i]) continue } else if (i == 1) continue
+                split(geo[i], a, /[x+]/)
+                s = s (s == "" ? "" : ";") a[3] "," a[4] "," (a[3] + a[1]) "," (a[4] + a[2])
+            }
+            if (s != "") print s
+        }'
+}
+
+x11_save_windows() {
+    command -v wmctrl >/dev/null 2>&1 || { log "wmctrl not found - not saving windows"; return 0; }
+    _rects=
+    if [ "$SAVE_WINDOWS" = secondary ]; then
+        _rects=$(secondary_rects)
+        if [ -z "$_rects" ]; then
+            : > "$POSFILE"
+            log "no secondary monitor - no windows to save"
+            return 0
+        fi
+    fi
+    _tmp=$POSFILE.$$
+    wmctrl -lG 2>/dev/null | awk -v mode="$SAVE_WINDOWS" -v rects="$_rects" '
+        BEGIN { n = split(rects, R, ";") }
+        $1 ~ /^0x[0-9a-fA-F]+$/ && $2 + 0 >= 0 {
+            if (mode == "all") { print $1, $3, $4, $5, $6; next }
+            cx = $3 + $5 / 2; cy = $4 + $6 / 2
+            for (k = 1; k <= n; k++) {
+                split(R[k], c, ",")
+                if (cx >= c[1] && cx < c[3] && cy >= c[2] && cy < c[4]) {
+                    print $1, $3, $4, $5, $6; break
+                }
+            }
+        }' | while read -r _id _x _y _w _h; do
+            case $(xprop -id "$_id" WM_STATE 2>/dev/null) in *Iconic*) continue ;; esac
+            _max=0
+            case $(xprop -id "$_id" _NET_WM_STATE 2>/dev/null) in *_NET_WM_STATE_MAXIMIZED*) _max=1 ;; esac
+            printf '%s %s %s %s %s %s\n' "$_id" "$_x" "$_y" "$_w" "$_h" "$_max"
+        done > "$_tmp"
+    mv -f "$_tmp" "$POSFILE"
+    log "saved $(wc -l < "$POSFILE" | tr -d ' ') window(s)"
+}
+#@@ end x11
+
+#@@ begin wayland
+wayland_save_windows() { return 0; }      # the compositor keeps its windows where they are
+#@@ end wayland
+
+save_windows() {
+    [ "$SAVE_WINDOWS" = no ] && return 0
+    be save_windows
+}
+
+# ----------------------------------------------------------------------------- brightness
+# The brightness each dimmed output had is kept in $DIMFILE ("output value" per line), so it is
+# put back exactly, and a restart of lock-guard while dimmed can still repair the screens.  A saved
+# value that is not a plausible brightness (some drivers report 0.0) is stored as 1.0: restoring
+# it literally would black the screen out.
+#
+# While the screens are dimmed a small keeper loop dims them again whenever something else puts
+# the brightness back (the screensaver's own fade, the driver when the monitors wake up).  The
+# keeper, dim and undim never run at the same moment: they take $DIMLOCK (a directory) first.
+
+nap() { sleep 0.2 2>/dev/null || sleep 1; }
+tick() { sleep 0.5 2>/dev/null || sleep 1; }
+
+dim_lock() {
+    _lt=0
+    until mkdir "$DIMLOCK" 2>/dev/null; do
+        _lt=$((_lt + 1))
+        if [ "$_lt" -gt 50 ]; then rmdir "$DIMLOCK" 2>/dev/null; _lt=0; fi     # holder died
+        nap
+    done
+}
+
+dim_unlock() { rmdir "$DIMLOCK" 2>/dev/null; return 0; }
+
+#@@ begin x11
+x11_keeper() { return 0; }
+
+x11_keeper_state() { xset q 2>/dev/null | sed -n 's/^ *Monitor is //p'; }
+
+x11_dim_capture() {      # print "output brightness" for every output to dim
+    command -v xrandr >/dev/null 2>&1 || { warn "xrandr not found"; return 0; }
+    xrandr --verbose 2>/dev/null | awk -v want="$DIM_OUTPUTS" '
+        BEGIN { n = split(want, W, " "); for (i = 1; i <= n; i++) ok[W[i]] = 1 }
+        /^[^ \t]/ { out = ""; if ($2 == "connected" && (n == 0 || ($1 in ok))) out = $1; next }
+        out != "" && $1 == "Brightness:" {
+            b = $2 + 0
+            if (b < 0.05 || b > 1) b = "1.0"; else b = $2
+            print out, b; out = ""
+        }'
+}
+
+x11_dim_apply() {        # dim every output listed in $DIMFILE (caller holds the lock)
+    set -- xrandr
+    while read -r _o _b; do set -- "$@" --output "$_o" --brightness "$LOCK_BRIGHTNESS"; done < "$DIMFILE"
+    [ $# -gt 1 ] || return 1
+    "$@" >/dev/null 2>&1
+}
+
+x11_dim_drifted() {      # succeed and print "output=value ..." if a dimmed output is no longer dim
+    xrandr --verbose 2>/dev/null | awk -v want="$LOCK_BRIGHTNESS" -v f="$DIMFILE" '
+        BEGIN { while ((getline l < f) > 0) { split(l, a, " "); mine[a[1]] = 1 } }
+        /^[^ \t]/ { out = ($1 in mine) ? $1 : ""; next }
+        out != "" && $1 == "Brightness:" {
+            d = $2 - want
+            if (d > 0.03 || d < -0.03) bad = bad " " out "=" $2
+            out = ""
+        }
+        END { if (bad != "") { print substr(bad, 2); exit 0 } exit 1 }'
+}
+
+x11_dim_restore() {      # 0 = restored, 2 = nothing to do, else failed
+    command -v xrandr >/dev/null 2>&1 || return 2
+    set -- xrandr
+    while read -r _o _b; do
+        case $_b in ''|*[!0-9.]*) continue ;; esac
+        set -- "$@" --output "$_o" --brightness "$_b"
+    done < "$DIMFILE"
+    [ $# -gt 1 ] || return 2
+    "$@" >/dev/null 2>&1
+}
+
+x11_status() {
+    echo "  input devices it would switch off: $(device_ids | tr '\n' ' ')"
+    if command -v xrandr >/dev/null 2>&1; then
+        echo "  brightness now: $(xrandr --verbose 2>/dev/null | awk '
+            /^[^ \t]/ { o = ($2 == "connected") ? $1 : ""; next }
+            o != "" && $1 == "Brightness:" { printf "%s=%s ", o, $2; o = "" }')"
+    fi
+}
+#@@ end x11
+
+#@@ begin wayland
+# Software dimming on Wayland goes through wl-gammarelay-rs (D-Bus property Brightness) unless
+# DIM_COMMAND / UNDIM_COMMAND say otherwise.  Nothing can read the brightness back from
+# the compositor in general, so there is no keeper loop here.
+wayland_keeper() { return 1; }
+
+wayland_dim_capture() {
+    if [ -n "$DIM_COMMAND" ]; then echo "all 1.0"; return 0; fi
+    command -v busctl >/dev/null 2>&1 || { warn "busctl not found (needed for wl-gammarelay-rs)"; return 0; }
+    _wb=$(busctl --user get-property rs.wl-gammarelay / rs.wl.gammarelay Brightness 2>/dev/null) || {
+        log "dim: wl-gammarelay-rs is not running (start it, or set DIM_COMMAND and UNDIM_COMMAND)"
+        return 0
+    }
+    _wb=${_wb#d }
+    case $_wb in ''|*[!0-9.]*) _wb=1.0 ;; esac
+    awk -v b="$_wb" 'BEGIN { exit !(b >= 0.05 && b <= 1) }' || _wb=1.0
+    echo "all $_wb"
+}
+
+wayland_dim_apply() {
+    if [ -n "$DIM_COMMAND" ]; then LEVEL=$LOCK_BRIGHTNESS run_cmd "$HOOK_TIMEOUT" "$DIM_COMMAND" >/dev/null 2>&1; return $?; fi
+    busctl --user set-property rs.wl-gammarelay / rs.wl.gammarelay Brightness d "$LOCK_BRIGHTNESS" >/dev/null 2>&1
+}
+
+wayland_dim_drifted() { return 1; }
+
+wayland_dim_restore() {
+    if [ -n "$UNDIM_COMMAND" ]; then run_cmd "$HOOK_TIMEOUT" "$UNDIM_COMMAND" >/dev/null 2>&1; return $?; fi
+    [ -n "$DIM_COMMAND" ] && return 2
+    command -v busctl >/dev/null 2>&1 || return 2
+    read -r _o _b < "$DIMFILE"
+    case $_b in ''|*[!0-9.]*) _b=1.0 ;; esac
+    busctl --user set-property rs.wl-gammarelay / rs.wl.gammarelay Brightness d "$_b" >/dev/null 2>&1
+}
+
+wayland_status() {
+    if [ -n "$DIM_COMMAND" ]; then
+        echo "  dimming: DIM_COMMAND / UNDIM_COMMAND"
+    elif command -v busctl >/dev/null 2>&1; then
+        echo "  wl-gammarelay-rs brightness now: $(busctl --user get-property rs.wl-gammarelay / rs.wl.gammarelay Brightness 2>/dev/null || echo 'not running')"
+    else
+        echo "  dimming: busctl not found"
+    fi
+    echo "  input commands: off=${INPUT_OFF_COMMAND:-<none>} on=${INPUT_ON_COMMAND:-<none>}"
+}
+#@@ end wayland
+
+dim_apply() { be dim_apply; }
+
+dim_keeper() {           # $1 = my token; ends when the screens are restored or a newer keeper starts
+    _kt=0 _streak=0 _pause=0
+    while :; do
+        tick
+        [ -f "$DIMFILE" ] || return 0
+        [ "$(cat "$KEEPFILE" 2>/dev/null)" = "$1" ] || return 0
+        _kt=$((_kt + 1))
+        if [ "$_pause" -gt 0 ]; then _pause=$((_pause - 1)); continue; fi
+        _ms=$(be keeper_state)
+        case $_ms in
+            On|'') ;;
+            *) [ $((_kt % 20)) -eq 0 ] || continue ;;      # asleep: nobody can see them, check rarely
+        esac
+        dim_lock
+        if [ -f "$DIMFILE" ] && [ "$(cat "$KEEPFILE" 2>/dev/null)" = "$1" ] && _bad=$(be dim_drifted); then
+            if dim_apply; then log "brightness was reset ($_bad) - dimmed again"; else log "re-dim failed"; fi
+            _streak=$((_streak + 1))
+            if [ "$_streak" -ge 3 ]; then
+                # it does not stay (or the driver reads it back wrongly): stop hammering xrandr
+                log "brightness keeps differing right after dimming - pausing the check for 30 s"
+                _streak=0 _pause=60
+            fi
+        else
+            _streak=0
+        fi
+        dim_unlock
+    done
+}
+
+dim_keeper_start() {
+    be keeper || return 0
+    KEEPGEN=$((${KEEPGEN:-0} + 1))
+    _tok=$$-$KEEPGEN
+    echo "$_tok" > "$KEEPFILE"
+    dim_keeper "$_tok" 3>&- &
+}
+
+dim_screens() {
+    [ -n "$LOCK_BRIGHTNESS" ] || return 0
+    dim_lock
+    if [ ! -f "$DIMFILE" ]; then
+        _orig=$(be dim_capture)
+        if [ -z "$_orig" ]; then
+            log "dim: no output to dim"
+        else
+            printf '%s\n' "$_orig" > "$DIMFILE"
+            if dim_apply; then
+                log "dimmed to $LOCK_BRIGHTNESS: $(printf '%s\n' "$_orig" | awk '{ printf "%s%s", (NR > 1 ? " " : ""), $1 }')"
+            else
+                log "dim failed (exit $?)"
+            fi
+        fi
+    fi
+    dim_unlock
+    if [ -f "$DIMFILE" ]; then dim_keeper_start; undim_key_start; fi
+    return 0
+}
+
+undim_screens() {
+    undim_key_stop
+    [ -f "$DIMFILE" ] || return 0
+    dim_lock
+    if [ -f "$DIMFILE" ]; then
+        be dim_restore
+        case $? in
+            0) log "brightness restored" ;;
+            2) ;;
+            *) log "brightness restore failed (exit $?)" ;;
+        esac
+        rm -f "$DIMFILE" "$KEEPFILE"      # always: a stale file would stop later locks from dimming
+    fi
+    dim_unlock
+    return 0
+}
+
+# ---------------------------------------------------------------------- early undim key
+# Resolve UNDIM_KEY to keycodes.  Prints "OK group group ..." (one group per key, each a comma
+# list of keycodes: Ctrl is both Control keys) or "BAD token".  A number is taken as a keycode.
+# Standard X11 keycodes (Linux evdev code + 8, US-style layout), written like 'xmodmap -pke' so the
+# same parser reads them.  Used when xmodmap is not installed or prints nothing.  Letters follow
+# the physical key position, so on another layout (Dvorak ...) give keycodes instead.
+key_table() {
+    cat <<'TABLE'
+keycode 9 = Escape Esc
+keycode 22 = BackSpace
+keycode 23 = Tab
+keycode 36 = Return Enter
+keycode 37 = Control_L
+keycode 50 = Shift_L
+keycode 62 = Shift_R
+keycode 64 = Alt_L
+keycode 65 = space
+keycode 66 = Caps_Lock
+keycode 105 = Control_R
+keycode 108 = Alt_R
+keycode 133 = Super_L
+keycode 134 = Super_R
+keycode 135 = Menu
+keycode 107 = Print
+keycode 78 = Scroll_Lock
+keycode 127 = Pause
+keycode 110 = Home
+keycode 111 = Up
+keycode 112 = Prior Page_Up PageUp
+keycode 113 = Left
+keycode 114 = Right
+keycode 115 = End
+keycode 116 = Down
+keycode 117 = Next Page_Down PageDown
+keycode 118 = Insert
+keycode 119 = Delete
+keycode 67 = F1
+keycode 68 = F2
+keycode 69 = F3
+keycode 70 = F4
+keycode 71 = F5
+keycode 72 = F6
+keycode 73 = F7
+keycode 74 = F8
+keycode 75 = F9
+keycode 76 = F10
+keycode 95 = F11
+keycode 96 = F12
+keycode 24 = q
+keycode 25 = w
+keycode 26 = e
+keycode 27 = r
+keycode 28 = t
+keycode 29 = y
+keycode 30 = u
+keycode 31 = i
+keycode 32 = o
+keycode 33 = p
+keycode 38 = a
+keycode 39 = s
+keycode 40 = d
+keycode 41 = f
+keycode 42 = g
+keycode 43 = h
+keycode 44 = j
+keycode 45 = k
+keycode 46 = l
+keycode 52 = z
+keycode 53 = x
+keycode 54 = c
+keycode 55 = v
+keycode 56 = b
+keycode 57 = n
+keycode 58 = m
+TABLE
+}
+
+key_groups() {
+    _km=$(xmodmap -pke 2>/dev/null) || _km=
+    [ -n "$_km" ] || _km=$(key_table)
+    printf '%s\n' "$_km" | awk -v spec="$UNDIM_KEY" '
+        BEGIN {
+            n = split(spec, T, "+")
+            for (i = 1; i <= n; i++) {
+                t = tolower(T[i])
+                if (t ~ /^[0-9]+$/) { code[i] = "," t; continue }
+                if (t == "ctrl" || t == "control") { want[i, "control_l"] = 1; want[i, "control_r"] = 1 }
+                else if (t == "alt") { want[i, "alt_l"] = 1; want[i, "alt_r"] = 1 }
+                else if (t == "shift") { want[i, "shift_l"] = 1; want[i, "shift_r"] = 1 }
+                else if (t == "super" || t == "win") { want[i, "super_l"] = 1; want[i, "super_r"] = 1 }
+                else want[i, t] = 1
+            }
+        }
+        $1 == "keycode" && $3 == "=" {
+            for (f = 4; f <= NF; f++) {
+                s = tolower($f)
+                for (i = 1; i <= n; i++)
+                    if (((i, s) in want) && index(code[i] ",", "," $2 ",") == 0) code[i] = code[i] "," $2
+            }
+        }
+        END {
+            out = "OK"
+            for (i = 1; i <= n; i++) {
+                if (code[i] == "") { print "BAD " T[i]; exit }
+                out = out " " substr(code[i], 2)
+            }
+            print out
+        }'
+}
+
+# awk for a live stream: mawk (the default awk on Debian/Ubuntu) waits for a whole buffer of input
+# before it runs anything, which would hold key events back; "-W interactive" makes it line-wise.
+awk_stream() {
+    if [ -z "${AWK_I:-}" ]; then
+        if awk -W version 2>&1 | grep -qi mawk; then AWK_I=1; else AWK_I=0; fi
+    fi
+    if [ "$AWK_I" = 1 ]; then awk -W interactive "$@"; else awk "$@"; fi
+}
+
+undim_key_stop() {
+    [ -f "$KEYPIDS" ] || return 0
+    read -r _kx _ka < "$KEYPIDS"
+    rm -f "$KEYPIDS" "$KEYFIFO"
+    if [ -n "${_kx:-}" ]; then kill "$_kx" 2>/dev/null; fi       # the key source; the rest ends with it
+    if [ -n "${_ka:-}" ]; then kill "$_ka" 2>/dev/null; fi
+    return 0
+}
+
+undim_early() {
+    log "undim key pressed - brightness restored early"
+    undim_screens
+}
+
+#@@ begin x11
+# Raw XInput2 events are delivered even while the lock screen has grabbed the keyboard.
+x11_key_check() {
+    command -v xinput >/dev/null 2>&1 || { log "undim key: xinput not found"; return 1; }
+}
+
+x11_key_source() {
+    if command -v stdbuf >/dev/null 2>&1; then exec stdbuf -oL xinput test-xi2 --root; fi
+    exec xinput test-xi2 --root
+}
+
+x11_key_rules() {
+    cat <<'RULES'
+/^EVENT type [0-9]+ \(RawKeyPress\)/   { ev = 1; next }
+/^EVENT type [0-9]+ \(RawKeyRelease\)/ { ev = 2; next }
+/^EVENT/ { ev = 0; next }
+ev && $1 == "detail:" { if (ev == 2) release($2); else press($2); ev = 0 }
+RULES
+}
+
+x11_key_hint() { echo "xinput exited"; }
+#@@ end x11
+
+#@@ begin wayland
+# libinput reads the keyboards directly, so it sees keys while the lock screen is up.  It needs
+# read access to /dev/input (root, or membership of the input group).  Its codes are evdev codes;
+# adding 8 gives the X keycodes used everywhere else in this file.
+wayland_key_check() {
+    command -v libinput >/dev/null 2>&1 || { log "undim key: libinput not found (package libinput-tools or libinput-utils)"; return 1; }
+}
+
+wayland_key_source() {
+    if command -v stdbuf >/dev/null 2>&1; then exec stdbuf -oL libinput debug-events --show-keycodes; fi
+    exec libinput debug-events --show-keycodes
+}
+
+wayland_key_rules() {
+    cat <<'RULES'
+$2 == "KEYBOARD_KEY" {
+    kc = $(NF - 1); gsub(/[()]/, "", kc)
+    if (kc ~ /^[0-9]+$/) {
+        if ($NF == "pressed") press(kc + 8)
+        else if ($NF == "released") release(kc + 8)
+    }
+}
+RULES
+}
+
+wayland_key_hint() { echo "libinput needs read access to /dev/input: run as root or join the 'input' group"; }
+#@@ end wayland
+
+# Key events go straight into awk, which only tracks which keys are down and prints "undim" when
+# the shortcut is complete; nothing else leaves it, and nothing is logged or stored.
+undim_key_start() {
+    [ -n "$UNDIM_KEY" ] && [ -f "$DIMFILE" ] || return 0
+    command -v "${SESSION_T}_key_source" >/dev/null 2>&1 || { log "undim key: this copy has no $SESSION_T key listener"; return 0; }
+    be key_check || return 0
+    _kg=$(key_groups)
+    case $_kg in
+        OK*) ;;
+        *) log "undim key: cannot use '$UNDIM_KEY' - no key called '${_kg#BAD }' (numbers work as keycodes; xmodmap knows more key names)"; return 0 ;;
+    esac
+    undim_key_stop
+    rm -f "$KEYFIFO"
+    mkfifo "$KEYFIFO" 2>/dev/null || { log "undim key: cannot create $KEYFIFO"; return 0; }
+    be key_source > "$KEYFIFO" 2>/dev/null 3>&- &
+    _kp=$!
+    _rules=$(be key_rules)
+    (
+        # shellcheck disable=SC2016   # the awk program is meant to be taken literally
+        awk_stream -v spec="${_kg#OK }" '
+            BEGIN {
+                ng = split(spec, G, " ")
+                for (i = 1; i <= ng; i++) { m = split(G[i], c, ","); for (j = 1; j <= m; j++) grp[c[j]] = i }
+            }
+            function release(k) { delete down[k] }
+            function press(k,   g, d, ok, have) {
+                if (k in down) return
+                down[k] = 1
+                if ((k in grp) && grp[k] == ng) {
+                    ok = 1
+                    for (g = 1; g < ng; g++) {
+                        have = 0
+                        for (d in down) if ((d in grp) && grp[d] == g) have = 1
+                        if (!have) ok = 0
+                    }
+                    if (ok) { print "undim"; fflush() }
+                }
+            }
+            '"$_rules" < "$KEYFIFO" | while read -r _t; do
+            if [ "$_t" = undim ]; then undim_early; fi
+        done
+        # still registered = nobody asked it to stop
+        if [ -f "$KEYPIDS" ]; then log "undim key: the key listener ended by itself ($(be key_hint))"; fi
+    ) 3>&- &
+    echo "$_kp $!" > "$KEYPIDS"
+    log "undim key ready: $UNDIM_KEY"
+}
+
+# ---------------------------------------------------------------------- lock / unlock events
+on_lock() {
+    [ "$STATE" = locked ] && return 0
+    STATE=locked
+    log "screen locked"
+    dim_screens
+    save_windows
+    set_input 0
+    hook_send lock
+}
+
+on_unlock() {
+    [ "$STATE" = unlocked ] && return 0
+    STATE=unlocked
+    log "screen unlocked"
+    set_input 1
+    undim_screens
+    hook_send unlock
+}
+
+# Hooks run in their own worker, fed through a FIFO, so they are strictly in order and a slow
+# or hung command can never hold up the lock / unlock handling above.
+hook_send() {
+    [ "$HOOKS" = 1 ] || return 0
+    { echo "$1" >&3; } 2>/dev/null
+    return 0
+}
+
+hook_worker() {
+    while read -r _tok; do
+        case $_tok in
+            lock) _cmd=$LOCK_COMMAND ;;
+            unlock) _cmd=$UNLOCK_COMMAND ;;
+            *) continue ;;
+        esac
+        [ -n "$_cmd" ] || continue
+        log "hook $_tok: $_cmd"
+        if command -v timeout >/dev/null 2>&1; then
+            timeout "$HOOK_TIMEOUT" sh -c "$_cmd" >> "$LOGFILE" 2>&1
+        else
+            sh -c "$_cmd" >> "$LOGFILE" 2>&1
+        fi
+        log "hook $_tok finished (exit $?)"
+    done
+}
+
+
+# ------------------------------------------------------------ noticing a lock (sources)
+# A source writes lines into $FIFO: dbus-monitor output (parsed below) or the words LOCKED /
+# UNLOCKED.  chk_NAME is called before anything is started, src_NAME starts the source.
+#@@ begin dbus
+chk_dbus() { command -v dbus-monitor >/dev/null 2>&1 || die "dbus-monitor not found (needed for LOCK_DETECT=dbus)"; }
+
+src_dbus() {
+    set --
+    for _i in $SCREENSAVER_INTERFACES; do set -- "$@" "type='signal',interface='$_i'"; done
+    if command -v stdbuf >/dev/null 2>&1; then
+        stdbuf -oL dbus-monitor --session "$@" > "$FIFO" 2>> "$LOGFILE" &
+    else
+        dbus-monitor --session "$@" > "$FIFO" 2>> "$LOGFILE" &
+    fi
+    MONPIDS="$MONPIDS $!"
+    log "watching $SCREENSAVER_INTERFACES (pid $$)"
+}
+#@@ end dbus
+
+#@@ begin process
+# Locks that do not announce themselves (swaylock, gtklock, i3lock ...) are noticed by their
+# process: locked while any program in LOCKER_PROCESSES runs under your user id.
+chk_process() { command -v pgrep >/dev/null 2>&1 || die "pgrep not found (needed for LOCK_DETECT=process)"; }
+
+src_process() {
+    _re=$(printf '%s' "$LOCKER_PROCESSES" | tr -s ' ' '|')
+    _re=${_re#|}; _re=${_re%|}
+    [ -n "$_re" ] || die "LOCKER_PROCESSES is empty"
+    _me=$(id -u)
+    (
+        _was=0
+        while :; do
+            if pgrep -u "$_me" -x "$_re" >/dev/null 2>&1; then _now=1; else _now=0; fi
+            if [ "$_now" != "$_was" ]; then
+                _was=$_now
+                if [ "$_now" = 1 ]; then echo LOCKED; else echo UNLOCKED; fi
+            fi
+            tick
+        done
+    ) > "$FIFO" 3>&- &
+    MONPIDS="$MONPIDS $!"
+    log "watching for a screen locker: $LOCKER_PROCESSES (pid $$)"
+}
+#@@ end process
+
+handle_events() {
+    STATE=unlocked
+    _pending=0
+    trap '' PIPE                     # a dead hook worker must never kill this loop
+    if [ "$HOOKS" = 1 ]; then exec 3> "$HOOKFIFO"; fi
+    while read -r _line; do
+        case $_line in
+            LOCKED) on_lock ;;
+            UNLOCKED) on_unlock ;;
+            signal*member=ActiveChanged*) _pending=1 ;;
+            signal*|method*|error*) _pending=0 ;;
+            *"boolean true"*)  [ "$_pending" = 1 ] && { _pending=0; on_lock; } ;;
+            *"boolean false"*) [ "$_pending" = 1 ] && { _pending=0; on_unlock; } ;;
+        esac
+    done
+    log "event source ended"
+}
+
+single_instance() {
+    PIDFILE=$RUNDIR/$NAME.pid
+    if [ -r "$PIDFILE" ]; then
+        _old=$(cat "$PIDFILE" 2>/dev/null)
+        if [ -n "$_old" ] && kill -0 "$_old" 2>/dev/null; then
+            _cmd=$(ps -p "$_old" -o args= 2>/dev/null) || _cmd=$NAME
+            case $_cmd in *"$NAME"*) die "already running (pid $_old)" ;; esac
+        fi
+    fi
+    echo $$ > "$PIDFILE"
+}
+
+
+shutdown() {
+    trap - EXIT INT TERM HUP
+    # shellcheck disable=SC2086   # a list of pids
+    kill $MONPIDS "${LOOPPID:-}" "${HOOKPID:-}" 2>/dev/null
+    set_input 1
+    undim_screens
+    rm -f "${FIFO:-}" "${HOOKFIFO:-}" "${PIDFILE:-}"
+    log "stopped"
+}
+
+watch() {
+    for _m in $DETECT_METHODS; do
+        command -v "src_$_m" >/dev/null 2>&1 || die "lock detection '$_m' is not in this copy of $NAME (it has:$(backends_present | sed 's/^/ /'))"
+        "chk_$_m"
+    done
+    single_instance
+    FIFO=$RUNDIR/$NAME.fifo
+    rm -f "$FIFO"
+    mkfifo "$FIFO" || die "cannot create $FIFO"
+    if [ "$HOOKS" = 1 ]; then
+        HOOKFIFO=$RUNDIR/$NAME.hooks
+        rm -f "$HOOKFIFO"
+        mkfifo "$HOOKFIFO" || die "cannot create $HOOKFIFO"
+        hook_worker < "$HOOKFIFO" &
+        HOOKPID=$!
+    fi
+    set_input 1                      # recover from an earlier crash while locked
+    undim_screens
+    MONPIDS=
+    for _m in $DETECT_METHODS; do "src_$_m"; done
+    handle_events < "$FIFO" &
+    LOOPPID=$!
+    trap 'shutdown; exit 0' INT TERM HUP
+    trap shutdown EXIT
+    log "session: $SESSION_T, lock detection: $DETECT_METHODS"
+    if [ -n "$CONF_WARN" ]; then log "config warnings: $CONF_WARN"; fi
+    if [ -n "$UNDIM_KEY" ]; then log "undim key: $UNDIM_KEY -> $(key_groups)"; fi
+    wait "$LOOPPID"
+}
+
+status_extra() {
+    echo "settings: $CONF"
+    echo "  session: $SESSION_T  lock detection: $DETECT_METHODS  (in this copy: $(backends_present))"
+    echo "  LOCK_BRIGHTNESS=${LOCK_BRIGHTNESS:-<off>}  DIM_OUTPUTS=${DIM_OUTPUTS:-<all connected>}"
+    echo "  DISABLE_INPUT=$DISABLE_INPUT  LOCK_DEVICE_PATTERN=${LOCK_DEVICE_PATTERN:-<every pointer>}"
+    be status
+    if [ -n "$UNDIM_KEY" ]; then echo "  UNDIM_KEY=$UNDIM_KEY -> $(key_groups)"; else echo "  UNDIM_KEY=<off>"; fi
+    if [ -f "$DIMFILE" ]; then echo "  screens are dimmed now (saved: $(tr '\n' ';' < "$DIMFILE"))"; fi
+    return 0
+}
+
+after_kill9() {          # the watcher could not clean up after itself
+    set_input 1
+    undim_screens
+    rm -f "$RUNDIR/$NAME.pid" "$RUNDIR/$NAME.fifo" "$RUNDIR/$NAME.hooks"
+}
+
+# ------------------------------------------------------------------ start / stop / status
+# pid of the running watcher (prints it, succeeds), or fail.  The pid file must name a live
+# process whose command line mentions this script, so a recycled pid is not mistaken for us.
+running_pid() {
+    _pf=$RUNDIR/$NAME.pid
+    [ -r "$_pf" ] || return 1
+    _rp=$(cat "$_pf" 2>/dev/null)
+    case $_rp in ''|*[!0-9]*) return 1 ;; esac
+    kill -0 "$_rp" 2>/dev/null || return 1
+    _cmd=$(ps -p "$_rp" -o args= 2>/dev/null) || _cmd=$NAME
+    case $_cmd in *"$NAME"*) echo "$_rp"; return 0 ;; esac
+    return 1
+}
+
+cmd_start() {
+    if _p=$(running_pid); then
+        echo "$NAME is already running (pid $_p)"
+        return 0
+    fi
+    if [ -x "$SELF" ]; then set -- "$SELF"; else set -- /bin/sh "$SELF"; fi
+    nohup "$@" -C "$CONF" </dev/null >/dev/null 2>> "$LOGFILE" &
+    _i=0
+    while [ "$_i" -lt 15 ]; do
+        nap
+        if _p=$(running_pid); then
+            echo "$NAME started (pid $_p)"
+            return 0
+        fi
+        _i=$((_i + 1))
+    done
+    echo "$NAME did not start; the end of $LOGFILE says:" >&2
+    tail -n 5 "$LOGFILE" >&2
+    return 1
+}
+
+cmd_stop() {
+    if ! _p=$(running_pid); then
+        echo "$NAME is not running"
+        return 0
+    fi
+    kill "$_p" 2>/dev/null
+    _i=0
+    while kill -0 "$_p" 2>/dev/null; do
+        _i=$((_i + 1))
+        if [ "$_i" -gt 25 ]; then
+            kill -9 "$_p" 2>/dev/null
+            echo "$NAME did not stop in 5 s and was killed" >&2
+            after_kill9
+            break
+        fi
+        nap
+    done
+    echo "$NAME stopped"
+    return 0
+}
+
+# Restart this program and its sibling (they are independent, but after an upgrade both need it).
+cmd_restart_all() {
+    _rc=0
+    cmd_stop
+    cmd_start || _rc=1
+    case $SELF in */*) _dir=${SELF%/*} ;; *) _dir=. ;; esac
+    [ -n "$SIBLING" ] || return "$_rc"       # install.sh blanks it when randr-fix was not installed
+    _sib=$_dir/$SIBLING
+    if [ -x "$_sib" ]; then
+        set -- "$_sib"
+    elif [ -f "$_sib" ]; then
+        set -- /bin/sh "$_sib"
+    else
+        echo "$SIBLING not found next to $SELF - not restarted" >&2
+        return 1
+    fi
+    "$@" --restart || _rc=1
+    return "$_rc"
+}
+
+cmd_status() {
+    _p=
+    if _p=$(running_pid); then echo "$NAME is running (pid $_p)"; _rc=0; else echo "$NAME is not running"; _rc=3; fi
+    status_extra
+    if [ -n "$CONF_WARN" ]; then echo "config warnings: $CONF_WARN"; fi
+    if [ -s "$LOGFILE" ]; then
+        echo "recent log ($LOGFILE):"
+        tail -n 6 "$LOGFILE" | sed 's/^/  /'
+    fi
+    return "$_rc"
+}
+
+# --------------------------------------------------------------------------------- main
+setup_rundir
+load_conf
+resolve_session
+case $ACTION in
+    enable) set_input 1; undim_screens; exit 0 ;;
+    undim)
+        if [ -f "$DIMFILE" ]; then log "undim requested (lock-guard --undim)"; fi
+        undim_screens; exit 0 ;;
+    start) cmd_start; exit $? ;;
+    stop) cmd_stop; exit $? ;;
+    restart) cmd_stop; cmd_start; exit $? ;;
+    restart-all) cmd_restart_all; exit $? ;;
+    status) cmd_status; exit $? ;;
+    watch) watch ;;
+esac

@@ -1,0 +1,31 @@
+Screen 0: minimum 320 x 200, current 3840 x 1080, maximum 16384 x 16384
+DisplayPort-0 connected primary 1920x1080+0+0 (0x4a) normal (normal left inverted right x axis y axis) 531mm x 299mm
+	Identifier: 0x48
+	Timestamp:  4294967295
+	Subpixel:   unknown
+	Gamma:      1.0:1.0:1.0
+	Brightness: 1.0
+	Clones:
+	CRTC:       0
+	CRTCs:      0 1 2 3
+  1920x1080 (0x4b) 346.500MHz +HSync +VSync *current +preferred
+        h: width  1920 start 1968 end 2000 total 2080 skew    0 clock 166.58KHz
+        v: height 1080 start 1083 end 1088 total 1111           clock 149.95Hz
+DisplayPort-1 disconnected (normal left inverted right x axis y axis)
+	Identifier: 0x49
+	Timestamp:  4294967295
+	Subpixel:   unknown
+	Clones:
+	CRTCs:      0 1 2 3
+HDMI-A-1-1 connected 1920x1080+1920+0 (0x5a) normal (normal left inverted right x axis y axis) 531mm x 299mm
+	Identifier: 0x58
+	Timestamp:  4294967295
+	Subpixel:   unknown
+	Gamma:      0.9:0.9:0.9
+	Brightness: 0.9
+	Clones:
+	CRTC:       1
+	CRTCs:      0 1 2 3
+  1920x1080 (0x5b) 148.500MHz +HSync +VSync *current +preferred
+        h: width  1920 start 2008 end 2052 total 2200 skew    0 clock  67.50KHz
+        v: height 1080 start 1084 end 1089 total 1125           clock  60.00Hz

@@ -1,0 +1,11 @@
+keycode   8 =
+keycode  37 = Control_L NoSymbol Control_L NoSymbol Control_L
+keycode  50 = Shift_L NoSymbol Shift_L NoSymbol Shift_L
+keycode  56 = b B b B
+keycode  62 = Shift_R NoSymbol Shift_R NoSymbol Shift_R
+keycode  64 = Alt_L Meta_L Alt_L Meta_L Alt_L Meta_L
+keycode  95 = F11 F11 F11 F11 F11 F11 XF86Switch_VT_11
+keycode  96 = F12 F12 F12 F12 F12 F12 XF86Switch_VT_12
+keycode 105 = Control_R NoSymbol Control_R NoSymbol Control_R
+keycode 133 = Super_L NoSymbol Super_L NoSymbol Super_L
+keycode  53 = x X x X
