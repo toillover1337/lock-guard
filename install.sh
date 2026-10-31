@@ -17,7 +17,7 @@
 # you have (default) and removes the rest from the installed copy; the program still picks the
 # right part each time it starts, so one install serves an X11 and a Wayland session alike.
 
-VERSION=1.1.0
+VERSION=1.1.1
 set -u
 HERE=$(cd "$(dirname "$0")" && pwd)
 PREFIX=${PREFIX:-${HOME:-}/.local}
@@ -31,6 +31,7 @@ ALL_VARIANTS="x11 wayland dbus process ddc"
 VARIANTS=auto
 YES=0
 ASK_STDIN=0
+REPEAT=0
 INIT_OVERRIDE=${SG_INIT:-}
 
 die() { printf 'install.sh: %s\n' "$*" >&2; exit 1; }
@@ -43,6 +44,7 @@ while [ $# -gt 0 ]; do
         --no-autostart) AUTOSTART=none; AUTOSTART_SET=1 ;;
         --init) [ $# -ge 2 ] || die "--init needs a name"; INIT_OVERRIDE=$2; shift ;;
         --yes|-y) YES=1 ;;
+        --repeat) REPEAT=1 ;;
         --list) ACTION=list ;;
         --answers-from-stdin) ASK_STDIN=1 ;;
         --uninstall) ACTION=uninstall ;;
@@ -108,6 +110,7 @@ record_write() {
         echo "# written by install.sh; used by --update to repeat your choices"
         echo "VERSION=$VERSION"
         echo "VARIANTS=$KEEP"
+        echo "PARTS=$ALL_VARIANTS"
         echo "AUTOSTART=$AUTOSTART"
         echo "PREFIX=$PREFIX"
     } > "$RECORD.new" 2>/dev/null && mv -f "$RECORD.new" "$RECORD"
@@ -195,7 +198,7 @@ do_update() {
     if [ "$VARIANTS" = auto ]; then _v=$(record_get VARIANTS); [ -n "$_v" ] && VARIANTS=$_v; fi
     if [ "$AUTOSTART_SET" = 0 ]; then _a=$(record_get AUTOSTART); [ -n "$_a" ] && { AUTOSTART=$_a; AUTOSTART_SET=1; }; fi
     if [ "$PREFIX_SET" = 0 ]; then _p=$(record_get PREFIX); [ -n "$_p" ] && PREFIX=$_p; fi
-    [ "$VARIANTS" = auto ] || set -- "$@" --variants "$VARIANTS"
+    [ "$VARIANTS" = auto ] || set -- "$@" --variants "$VARIANTS" --repeat
     [ "$AUTOSTART_SET" = 0 ] || set -- "$@" --autostart "$AUTOSTART"
     set -- "$@" --prefix "$PREFIX" --yes
     [ -n "$INIT_OVERRIDE" ] && set -- "$@" --init "$INIT_OVERRIDE"
@@ -366,11 +369,28 @@ check_variants() {
     return 0
 }
 
+# add_new_parts DEFAULTS: an update repeats the earlier choices, but a part that did not exist at
+# the earlier install was never chosen or declined.  It is judged like on a fresh install: kept
+# when this machine can use it, otherwise left out (and said so).
+add_new_parts() {
+    _known=$(record_get PARTS)
+    [ -n "$_known" ] || _known="x11 wayland dbus process"      # records of 1.0.x did not list them
+    for _v in $ALL_VARIANTS; do
+        case " $_known " in *" $_v "*) continue ;; esac
+        case " $KEEP " in *" $_v "*) continue ;; esac
+        case " $1 " in
+            *" $_v "*) KEEP=$(parse_variants "$KEEP $_v" "$1") && echo "new part in this release: $_v - added ($(why_variant "$_v"))" ;;
+            *) echo "new part in this release: $_v - not added, this machine does not seem to need it (add it with: install.sh --variants +$_v)" ;;
+        esac
+    done
+}
+
 choose_variants() {
     _def=$(default_variants)
     if [ "$VARIANTS" != auto ]; then
         KEEP=$(parse_variants "$VARIANTS" "$_def") || die "bad --variants"
         check_variants "$KEEP" || die "bad --variants"
+        [ "$REPEAT" = 0 ] || add_new_parts "$_def"
         return 0
     fi
     echo

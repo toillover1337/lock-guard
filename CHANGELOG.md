@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.1.1 - 2026-10
+
+- `--update` no longer silently drops a part that is new since the install: it is added when the
+  machine can use it (e.g. `ddc` with `ddcutil` present), otherwise a line says how to add it.
+  Parts pruned on purpose stay pruned. The install record now lists the parts it knew (`PARTS=`);
+  records from 1.0.x are read as the four parts that existed then.
+
 ## 1.1.0 - 2026-10
 
 - New optional `ddc` part: `LOCK_BACKLIGHT` lowers the monitors' real backlight over DDC/CI

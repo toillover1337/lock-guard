@@ -74,6 +74,9 @@ What an update does and does not do:
 
 * It repeats the choices you made at the first install (kept parts, autostart method, prefix),
   recorded in `~/.config/screen-guard/install.conf`; options on the command line win.
+* A part that did not exist when you installed (a new release may add one) was never chosen or
+  declined, so it is judged like on a fresh install: added when this machine can use it, otherwise
+  left out with a line saying how to add it (`--variants +NAME`). A part you pruned stays pruned.
 * Your configs are kept; new options are appended commented out, as on any upgrade.
 * The previous scripts are copied to `~/.config/screen-guard/previous/` first, so going back is a
   copy. The running programs are restarted at the end (it asks, unless `--yes`).

@@ -1164,6 +1164,28 @@ EOF
     check "update: the restart question was asked and declined" has "$UH/o" "Restart later with"
     check "update: configs untouched (no config created twice)" sh -c "test -s $UH/h/.config/lock-guard/config"
 
+    # parts that did not exist at the first install are judged like on a fresh install
+    mkdir -p "$UH/ddcstub"; printf '#!/bin/sh\nexit 0\n' > "$UH/ddcstub/ddcutil"; chmod +x "$UH/ddcstub/ddcutil"
+    mkdir -p "$UH/xstub"; printf '#!/bin/sh\nexit 0\n' > "$UH/xstub/Xorg"; chmod +x "$UH/xstub/Xorg"
+    legacy() {      # make the install record look like one written before PARTS existed
+        grep -v '^PARTS=' "$UH/h/.config/screen-guard/install.conf" > "$UH/rec.t" && cat "$UH/rec.t" > "$UH/h/.config/screen-guard/install.conf"
+    }
+    newuh; uinst --yes --variants x11,dbus --autostart none > /dev/null 2>&1; legacy
+    mkrelease 9.0.4; chmod -R a+rX "$UH"; [ "$(id -u)" = 0 ] && chown -R 65534:65534 "$UH"
+    UD="$UH/xstub:$UH/ddcstub:$UH/stub:$ORIGPATH" uinst --update --yes > "$UH/o" 2>&1
+    check "update: a part new since the install is added when this machine can use it" has "$UH/o" "new part in this release: ddc - added"
+    check "update: and it is in the installed copy" sh -c "grep -q '^#@@ begin ddc' $ULG && ! grep -q '^#@@ begin wayland' $ULG"
+    check "update: the record now lists the parts it knows" has "$UH/h/.config/screen-guard/install.conf" "^PARTS=x11 wayland dbus process ddc$"
+    newuh; uinst --yes --variants x11,dbus --autostart none > /dev/null 2>&1; legacy
+    mkrelease 9.0.5; chmod -R a+rX "$UH"; [ "$(id -u)" = 0 ] && chown -R 65534:65534 "$UH"
+    UD="$UH/xstub:$UH/stub:$ORIGPATH" uinst --update --yes > "$UH/o" 2>&1
+    check "update: a new part this machine does not need is left out, with the way to add it" has "$UH/o" "new part in this release: ddc - not added.*--variants +ddc"
+    check "update: and it is not in the installed copy" sh -c "! grep -q '^#@@ begin ddc' $ULG"
+    newuh; uinst --yes --variants x11,dbus --autostart none > /dev/null 2>&1
+    mkrelease 9.0.6; chmod -R a+rX "$UH"; [ "$(id -u)" = 0 ] && chown -R 65534:65534 "$UH"
+    UD="$UH/xstub:$UH/ddcstub:$UH/stub:$ORIGPATH" uinst --update --yes > "$UH/o" 2>&1
+    check "update: a part pruned on purpose stays pruned" sh -c "! grep -q '^#@@ begin ddc' $ULG && ! grep -q 'new part in this release' $UH/o"
+
     # an update asked to restart the running copies does so
     uinst --yes --autostart none > /dev/null 2>&1
     printf 'SESSION=wayland\n' > "$UH/h/.config/lock-guard/config"; [ "$(id -u)" = 0 ] && chown 65534:65534 "$UH/h/.config/lock-guard/config"
